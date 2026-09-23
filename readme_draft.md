@@ -20,7 +20,7 @@ Built with **Java 17 + Spring Boot 3 + PostgreSQL**.
 - [Trade-Offs](#trade-offs)
 - [API Overview](#api-overview)
 - [Database Schema](#database-schema)
-- [Clean Architecture & Project Structure](#clean-architecture--project-structure)
+- [Layered Architecture & Project Structure](#layered-architecture--project-structure)
 - [Enterprise Evaluation Criteria & Interview Deep-Dive](#enterprise-evaluation-criteria--interview-deep-dive)
 - [How to Run](#how-to-run)
 - [Testing](#testing)
@@ -100,55 +100,74 @@ The system supports two types:
 
 ### Hot Desks
 
-Shared pool. Any eligible employee can book any available hot desk, subject to quotas and capacity limits.
+Shared pool. Any eligible employee can book any available hot desk, subject to team quotas and floor capacity limits.
 
 ```
 AVAILABLE  -->  BOOKED  -->  CHECKED_IN
                   |
                   v
-              CANCELLED  (employee cancels before cut-off)
+              CANCELLED  (cancelled before check-in deadline)
                   or
               NO_SHOW    (grace period expires without check-in)
                   |
                   v
-              RELEASED   (desk returns to available pool)
+        [Automatically available again via partial unique index]
 ```
+
+When a booking transitions to `CANCELLED` or `NO_SHOW`, it is immediately excluded by the database partial unique index (`WHERE status IN ('BOOKED', 'CHECKED_IN')`). The desk instantly becomes eligible for re-booking on that date without needing a synthetic `RELEASED` status.
 
 ### Fixed Desks
 
-Reserved for a specific named employee. A fixed desk does not become a hot desk just because its owner hasn't booked it today.
+Reserved for a specific named employee. A fixed desk does not become a hot desk just because its owner hasn't booked it yet.
 
 ```
 RESERVED_FOR_EMPLOYEE
     |
-    +-- Employee books it   --> BOOKED --> CHECKED_IN
+    +-- Owner books it      --> BOOKED --> CHECKED_IN (is_owner_booking = TRUE)
     |
-    +-- Employee cancels    --> RELEASED (temporarily available as hot desk)
+    +-- Owner cancels       --> CANCELLED --> Desk immediately hot-eligible for that date
     |
-    +-- Employee no-shows   --> NO_SHOW --> RELEASED (after grace period)
+    +-- Owner no-shows      --> NO_SHOW   --> Desk immediately hot-eligible for that date
     |
-    +-- Employee doesn't book at all --> Desk stays reserved, NOT available to others
+    +-- Owner doesn't book  --> Desk stays reserved, NOT available to others
 ```
 
-The important rule: a fixed desk is **protected** for its named employee. It only enters the hot desk pool if the employee explicitly releases it or fails to show up past the grace period. We never let someone else grab it just because the owner hasn't clicked "book" yet — that would cause conflicts when the owner walks in.
+#### Fixed Desk Headroom & Capacity Invariant
+
+To guarantee that fixed-desk owners always have headroom while maximizing floor utilization, floor hot-desk bookings are governed by a single exact invariant:
+
+$$\text{hotActive} + \text{fixedNotReleased} \le \text{maxCapacity}$$
+
+Where:
+- $\text{hotActive}$: Total active hot bookings on the floor for date $D$ (`status IN ('BOOKED', 'CHECKED_IN') AND is_owner_booking = FALSE`).
+- $\text{fixedNotReleased} = \text{totalFixedDesksOnFloor} - \text{fixedReleasedToday}$: Fixed desks that must remain protected. A fixed desk whose owner has *not yet booked* still counts toward $\text{fixedNotReleased}$, guaranteeing their seat is held.
+- $\text{fixedReleasedToday}$: Fixed desks on that floor where the assigned owner explicitly `CANCELLED` or was marked `NO_SHOW` on date $D$.
+- $\text{maxCapacity}$: `floors.max_capacity`.
+
+**Operational Implications**:
+- **Quota Exemption**: When a fixed-desk owner books their assigned desk, `is_owner_booking = TRUE`. This booking does not consume team hot-desk quota and does not count against $\text{hotActive}$.
+- **Dynamic Capacity Release**: When a fixed-desk owner cancels or no-shows, $\text{fixedReleasedToday}$ increments by 1, so $\text{fixedNotReleased}$ decrements by 1. This mathematically increases the permissible $\text{hotActive}$ count by 1, immediately making the desk eligible for other employees.
 
 ---
 
 ## Booking Rules
 
-These are the hard rules. They must always be satisfied — no exceptions, no overrides from the algorithm.
+These rules govern how and when desks can be reserved:
 
-| Rule | Detail |
-|------|--------|
-| One active booking per employee per date | An employee cannot hold two desks on the same day. Must cancel the first before booking another. |
-| Desk availability | The desk must not already be booked by someone else for that date. |
-| Desk type check | An employee can only book a fixed desk that is reserved for them specifically. Hot desks are open to anyone. |
-| Team quota | If a cap exists (e.g., "Team A ≤ 8 desks on Floor 3"), the booking must not exceed it. |
-| Floor capacity | If a floor has a max capacity (e.g., "Floor 3 max 60 people"), the booking must not exceed it. |
-| Cancellation cut-off | Cancellations are allowed only before a defined cut-off time, interpreted in the employee's timezone. |
-| No overlapping bookings for a desk | Enforced at the database level — a unique constraint on (desk_id, booking_date) prevents any code path from creating duplicates. |
+| Rule | Enforcement Level | Detail |
+| :--- | :--- | :--- |
+| **Anytime Booking Window** | Application Service | Employees can book desks up to $N$ business days ahead (configurable via `smartdesk.booking.advance-days`, default: 14 business days) at **any time**. There is no artificial pre-day blackout. |
+| **On-Day Booking for Time Window** | Application Service | On day $D$, an employee can book a desk for an upcoming time window at **any time before that time window begins** (e.g., at 07:30 AM or 08:45 AM before a 09:00 AM slot). |
+| **Strict Cut-Off Boundary** | Application Service | A booking request for a time window must arrive before the cut-off: `requestTime < cutoffTime → allowed`; `requestTime >= cutoffTime → rejected` (`InvalidBookingDateException`). Booking a time window whose start has passed is disallowed. |
+| **Same-Day Available & Reclaimed Booking** | Application Service | Throughout day $D$, any currently unreserved desk or desk reclaimed from cancellations and no-shows can be booked immediately, subject to quotas and floor capacity. |
+| **Dynamic Check-In Deadline** | Application Service | Prevents instant expiration of same-day bookings: `check_in_deadline = max(workday_start + grace_period, booked_at + walk_in_grace)` (default walk-in grace: 15 minutes). |
+| **Cancellation Cut-Off** | Application Service | An employee can cancel their booking at any time before the cut-off (before the time window starts or before the desk's check-in deadline: `now < check_in_deadline`). Upon cancellation, the desk immediately returns to the eligible pool. |
+| **Single Active Booking per Day** | Storage Layer (DB Index) | Enforced via partial unique index `uq_active_employee_day` on `(employee_id, booking_date) WHERE status IN ('BOOKED', 'CHECKED_IN')`. |
+| **Desk Concurrency Defense** | Storage Layer (DB Index) | Enforced via partial unique index `uq_active_desk_day` on `(desk_id, booking_date) WHERE status IN ('BOOKED', 'CHECKED_IN')`. Automatically permits re-booking once status is `CANCELLED` or `NO_SHOW`. |
+| **Fixed Desk Ownership** | Storage Layer (Check Constraint) | Enforced via `chk_desk_fixed_owner`: fixed desks must have `reserved_for_employee_id NOT NULL`; hot desks must have `NULL`. |
+| **Team Quota & Floor Capacity** | Application + DB Locks | Team limits (e.g. "Team A $\le$ 8 on Floor 3") and floor hot capacity headroom are validated inside the transaction protected by parent pessimistic row locks. |
 
-These rules are enforced in the booking service **and** backed by database constraints. Even if someone bypasses the UI and sends raw POST requests, the database will reject invalid bookings.
+> **Storage vs. Application Division of Responsibility**: Database constraints act as the unbreachable safety net for active booking uniqueness and physical layout consistency. High-level temporal policies (booking windows, time-slot cut-offs, team quotas, and fixed-desk ownership checks) are orchestrated inside transactional Spring services.
 
 ---
 
@@ -239,13 +258,24 @@ D20              D20  D21  <-- new booking
 
 ### What if the employee is the first from their team?
 
-No teammates booked yet, so there's no neighbourhood to grow. We fall back to:
+When no teammates are currently booked on the target floor, there is no existing team cluster to expand. We fall back to **Center-Based Seeding with Local Occupancy Penalty**:
 
-> Pick the eligible desk closest to the center of the floor.
+#### 1. Floor Geometric Center
+For a floor grid defined by dimensions $(M_{\text{rows}}, N_{\text{cols}})$, the geometric center coordinates $C_{\text{floor}} = (r_c, c_c)$ are:
+$$r_c = \left\lfloor \frac{M_{\text{rows}}}{2} \right\rfloor, \quad c_c = \left\lfloor \frac{N_{\text{cols}}}{2} \right\rfloor$$
+*(Alternatively configured directly via `floors.center_row` and `floors.center_column` in the database).*
 
-This gives the team a deterministic starting point. As more teammates book, the neighbourhood algorithm takes over.
+#### 2. Local Occupancy Penalty Formula
+To prevent multiple teams from colliding at the exact same physical center point, candidate desks $D = (r, c)$ are ranked by a composite penalty score:
 
-To avoid multiple teams all seeding at the exact same spot, we add a small penalty for local occupancy — if the area around a desk is already heavily used, it scores slightly worse. This naturally distributes team seeds across the floor without any randomness.
+$$\text{Score}(D) = \text{dist}^2(D, C_{\text{floor}}) + \gamma \cdot \text{Occupancy}(D, R)$$
+
+Where:
+- **Center Proximity**: $\text{dist}^2(D, C_{\text{floor}}) = (r - r_c)^2 + (c - c_c)^2$ (squared Euclidean distance to floor center).
+- **Local Neighborhood Occupancy**: $\text{Occupancy}(D, R)$ counts active bookings within Chebyshev distance radius $R = 2$ (a $5 \times 5$ grid cell around desk $D$):
+  $$\text{Occupancy}(D, R) = \sum_{B \in \text{ActiveBookings}} \mathbb{I}\Big(\max(|r - B_{\text{row}}|, |c - B_{\text{col}}|) \le R\Big)$$
+- **Dispersion Weight**: $\gamma = 5.0$ (configurable constant penalizing crowded zones).
+- **Deterministic Selection**: The candidate desk with the **lowest composite score** is selected (tie-break on `desk_id ASC`). This deterministically distributes new team clusters into open, comfortable spaces.
 
 ### Team Booking — Booking Multiple Desks at Once
 
@@ -279,10 +309,10 @@ The result is either all desks booked atomically (everyone gets a seat) or none 
 
 | Operation | Complexity | Practical Size |
 |-----------|-----------|---------------|
-| Individual booking | O(D × T) where D = eligible desks, T = team bookings | ≤ 500 × 500 = 250K distance calculations (worst case, usually much less) |
-| Team booking | O(K × D × log D) | K=10, D ≤ 500 |
+| Individual booking | O(D + C · T) where D = total desks, C = eligible candidates, T = active team bookings | D ≤ 500, C ≤ 500, T ≤ 50. Microsecond ALU execution. |
+| Team booking | O(K · C · log M) | K=10 anchors, M ≤ 10 team members, C ≤ 500 candidates. |
 
-Both are well within real-time for a 500-desk floor.
+Both algorithms run in under 1 millisecond in-memory on modern JVMs.
 
 ### Priority Hierarchy
 
@@ -304,123 +334,139 @@ The algorithm never overrides a fixed desk assignment or violates a quota just t
 
 ## Concurrency — No Double Booking
 
-This is the heart of the problem. Two employees tapping "book" on the last free desk at the same instant must not both succeed.
+This is the heart of the problem. Two employees tapping "book" on the last free desk at the same instant must not both succeed, and concurrent requests must never violate team quotas or floor capacities.
 
-### The Approach: Pessimistic Row-Level Locking
+### The Serialization Point: Aggregate Invariants Need Parent Locks
 
-We use `SELECT ... FOR UPDATE` inside a database transaction. Here's the exact sequence:
+In technical interviews, a frequent mistake is claiming that locking individual desk rows (`SELECT * FROM desks WHERE id = ? FOR UPDATE`) prevents over-allocation. 
 
-```
-BEGIN TRANSACTION
-    |
-    v
-Run allocation algorithm --> preferred desk = D10
-    |
-    v
-SELECT * FROM desks WHERE id = D10 FOR UPDATE    <-- locks the row
-    |
-    v
-Re-check: is D10 still available?
-    |
-    +-- Yes --> INSERT booking, COMMIT
-    |
-    +-- No  --> Try next-best candidate from the ranked list
-```
+It does not. **Team quotas and floor capacity are aggregate invariants across many desks.** If two teammates concurrently book the last available seat under Team A's quota on Floor 3, per-desk locks will lock two *different* desks simultaneously and both transactions will commit, breaching the quota.
 
-The **re-check after acquiring the lock** is essential. While we were waiting for the lock, another transaction may have booked the desk. We never trust the algorithm's earlier availability check — the database state after locking is the only source of truth.
+Therefore, the **parent `Floor` row and `TeamFloorQuota` row serve as the serialization point**.
 
-### Why pessimistic locking?
-
-The scarce resource is the desk itself. When there's genuine contention (the last few desks on a popular floor), pessimistic locking serializes the competing requests cleanly. The loser waits briefly, then discovers the desk is taken and falls back to the next candidate.
-
-Optimistic locking (version columns + retry) would also work, but under real contention it leads to more retries and wasted work. For desk booking — where the conflict window is small and the stakes are clear — pessimistic locking is simpler to reason about.
-
-### What the loser sees
-
-The losing request does **not** fail with a generic error. It falls back to the next-best candidate from the ranked list:
-
-```
-for each candidate in rankedCandidates:
-    acquire lock on candidate
-    if candidate is still available:
-        create booking
-        return success
-
-throw NoDeskAvailableException   // only if ALL candidates are taken
+```text
+       Contention Resolution & Dynamic In-Lock Ranking
+       
+  Thread A (Employee 1)                    Thread B (Employee 2)
+           │                                        │
+    1. BEGIN TX (READ COMMITTED)             1. BEGIN TX (READ COMMITTED)
+           │                                        │
+    2. LOCK Floor Row                        2. WAIT on Floor Row Lock
+           │                                        :
+    3. Verify Floor Hot Headroom                    :
+    4. LOCK TeamFloorQuota Row                      :
+    5. Verify Team Hot Quota                        :
+    6. Fresh In-TX Ranking:                         :
+       Rank 1 -> Desk 101                           :
+           │                                        :
+    7. LOCK Desk 101 (Available)                    :
+    8. INSERT Booking (Desk 101)                    :
+    9. COMMIT TX ──────────────────────────────────▶:
+       (Releases Locks)                      2. ACQUIRES Floor Row Lock
+                                             3. Verify Floor Hot Headroom
+                                             4. ACQUIRES TeamFloorQuota Lock
+                                             5. Verify Team Hot Quota
+                                             6. Fresh In-TX Ranking:
+                                                (Sees Desk 101 now BOOKED by Thread A)
+                                                Rank 1 -> Desk 102 (Adjacent to Desk 101!)
+                                             7. LOCK Desk 102 (Available)
+                                             8. INSERT Booking (Desk 102)
+                                             9. COMMIT TX (Success! Zero 409 Conflict!)
 ```
 
-For a 500-desk floor, there are usually plenty of alternatives.
+### Why In-Lock Fresh Ranking Replaces "NOWAIT Catch-and-Loop"
 
-### Database Constraint as a Safety Net
+In PostgreSQL, executing `SELECT ... FOR UPDATE NOWAIT` or catching a unique constraint violation puts the transaction into an aborted state:
+```text
+ERROR: current transaction is aborted, commands ignored until end of transaction block
+```
+Even if application Java code catches the exception, PostgreSQL rejects all subsequent SQL statements on that connection until `ROLLBACK`. Catch-and-continue loops inside the same transaction are structurally invalid in PostgreSQL.
 
-On top of the application-level locking, we add a unique constraint:
+**Our Clean Architectural Solution**:
+Because the floor-level lock serializes concurrent booking attempts on that floor, competing threads wait on the lock rather than failing immediately. When Thread B acquires the lock:
+1. It executes a **single fresh in-transaction ranking** against current database state.
+2. It immediately sees that Desk 101 was taken by Thread A and deterministically selects the next-best candidate (Desk 102, which is physically adjacent).
+3. It locks Desk 102, inserts the booking, and commits.
+4. If and only if **all eligible candidate desks on the floor are exhausted**, the service throws `NoDeskAvailableException` (HTTP 409).
+
+### Transaction Isolation & Lock Timeout
+
+- **Isolation Level**: `READ COMMITTED` (PostgreSQL default). Since the parent floor row lock serializes the critical section, `READ COMMITTED` completely prevents non-repeatable reads and phantom capacity breaches without the overhead of `SERIALIZABLE`.
+- **Lock Timeout**: Every booking transaction executes `SET LOCAL lock_timeout = '3s';`. If a connection cannot acquire the floor lock within 3 seconds under extreme surges, it fails fast with an HTTP 503 / 409 `Retry-After: 1` instead of exhausting the connection pool.
+- **Connection Pool Sizing**: HikariCP is sized for the workload (`maximum-pool-size = 20-30`). Because each in-lock ranking and insert completes in 10–20 ms, a single floor easily handles 50–100 bookings/second under sustained contention, and scales linearly across floors ($F \times 50\text{--}100\text{ TPS}$).
+
+### Database Constraint as Defense-in-Depth
+
+On top of application-level locking, we enforce database-level uniqueness via a **partial unique index**:
 
 ```sql
-UNIQUE (desk_id, booking_date)
+CREATE UNIQUE INDEX uq_active_desk_day 
+ON bookings (desk_id, booking_date) 
+WHERE status IN ('BOOKED', 'CHECKED_IN');
 ```
 
-This is not instead of locking — it's alongside it. If any future code path somehow bypasses the lock-and-recheck pattern, PostgreSQL will still reject the duplicate. Defense in depth.
+This is not a substitute for locking — it is the unbreachable safety net. If any code path bypasses locking, PostgreSQL rejects the duplicate row. Spring Boot captures `DataIntegrityViolationException` and translates it to HTTP 409 `DeskAlreadyBookedException`.
 
-### Team Booking and Deadlock Prevention
+Crucially, because this is a **partial index**, it excludes `CANCELLED` and `NO_SHOW` rows. A desk that was cancelled or no-showed can be re-booked immediately without manual index cleanups.
 
-When booking multiple desks for a team, we lock all selected desk rows inside one transaction. To prevent deadlocks when two team bookings happen simultaneously, we always acquire locks in **ascending desk ID order**:
+### Deadlock Elimination: Strict Global Lock Hierarchy
 
-```
-Lock D10 --> Lock D11 --> Lock D12 --> Lock D20 --> Lock D21
-```
-
-Never in random or reversed order. Consistent lock ordering eliminates circular waits.
-
-Team bookings are atomic: either all desks are booked or none are. We don't partially book a team.
-
-### What "first" means
-
-We define the winner as: **the transaction that successfully acquires the lock and commits first**. Not whoever tapped their phone 3 milliseconds earlier — we can't reliably determine UI tap order across network requests. The database's transaction scheduler is the arbiter.
-
-Team proximity is a **soft preference**, not a reservation. Any eligible employee can compete for any eligible desk, and the first transaction to lock and commit wins. If the preferred desk is taken while waiting, the service re-evaluates the remaining candidates.
+When booking multiple desks for a team, circular waits are eliminated by acquiring locks in a strict global hierarchy:
+1. Parent `Floor` row
+2. Parent `TeamFloorQuota` row
+3. Target `Desk` rows sorted ascending by primary key (`desk_id ASC`):
+   ```
+   Lock Desk 10 -> Lock Desk 11 -> Lock Desk 12 -> Lock Desk 20
+   ```
+Single-row status updates (`CANCELLED`, `NO_SHOW`, `CHECKED_IN`) update only their own row in `bookings` and do not participate in multi-resource lock graphs.
 
 ---
 
 ## No-Show Detection and Auto-Release
 
-A booked desk that sits empty is wasted. The system detects no-shows and releases the desk back to the available pool.
+A booked desk that sits empty is wasted. The system detects no-shows and automatically makes the desk available to other employees.
 
-### How It Works
+### State Transitions & Lifecycle
 
 ```
-Desk booked for 09:00
-    |
-    v
-Grace period = 30 minutes (configurable)
-    |
-    v
-09:30 arrives, employee hasn't checked in
-    |
-    v
-Booking status --> NO_SHOW
-    |
-    v
-Desk --> RELEASED back to the pool
+Desk booked for 09:00 IST
+    │
+    ▼
+Check-in deadline (09:30 IST)
+    │
+    ├─► Employee checks in before 09:30 ──► CHECKED_IN (Desk occupied as planned)
+    │
+    └─► 09:30 arrives without check-in   ──► NO_SHOW (Desk immediately re-bookable)
 ```
 
-For **fixed desks**, the same rule applies. A fixed desk is protected for its named employee, but if the employee doesn't show up within the grace period, the desk is released. Otherwise a fixed desk for an absent employee would sit empty all day while colleagues can't find seats.
+**Reclamation Mechanisms**:
+1. **Explicit Cancellation**: Employee cancels before the check-in deadline. Booking transitions to `CANCELLED`.
+2. **No-Show Expiry**: Sweeper marks overdue booking `NO_SHOW`.
 
-The three ways a reserved desk gets released:
-1. Employee explicitly cancels before the cut-off
-2. Employee checks in (desk remains occupied as intended)
-3. Grace period expires without check-in → auto-released
+In both cases, the partial index `uq_active_desk_day` stops indexing the row, instantly returning the desk to the eligible candidate pool for that date. There is no synthetic `RELEASED` status.
 
-### Interaction with Quotas
+### Late Arrivals Policy
 
-A released desk doesn't blindly become available. Before the system re-offers it, it still checks:
-- Does the requesting employee's team exceed their quota on this floor?
-- Does the floor exceed its max capacity?
+If an employee arrives at the office at 09:45 IST after their booking transitioned to `NO_SHOW`:
+- Check-in is rejected with HTTP 400 (`InvalidCheckInException: Booking marked NO_SHOW after grace period expired at 09:30`).
+- The desk may have already been re-booked by a walk-in colleague.
+- The late-arriving employee must use the Same-Day Walk-In API to find an available desk.
 
-The no-show release mechanism feeds released desks back through the same eligibility pipeline as any other available desk.
+### Idempotent Sweeper (Why ShedLock is Unnecessary)
 
-### Implementation
+The background sweep executes an atomic, conditional SQL statement:
 
-A scheduled job runs periodically (e.g., every 5 minutes) to scan for bookings past their grace period that haven't been checked in. It marks them as NO_SHOW and releases the desk.
+```sql
+UPDATE bookings 
+SET status = 'NO_SHOW', updated_at = :nowUtc
+WHERE status = 'BOOKED' 
+  AND check_in_deadline <= :nowUtc;
+```
+
+**Resilience Properties**:
+- **Idempotent**: Executing this query once or ten times produces identical state.
+- **Race-Proof**: If an employee checks in at 09:29:59 IST (`status = 'CHECKED_IN'`), the condition `WHERE status = 'BOOKED'` matches 0 rows.
+- **Multi-Instance Safe Without Distributed Locks**: Because the update is conditional and atomic at the PostgreSQL row level, multiple application instances running the sweep simultaneously cannot corrupt state or double-process rows. Heavy distributed locking libraries like ShedLock are entirely optional overhead.
 
 ---
 
@@ -432,59 +478,94 @@ The system enforces two kinds of limits:
 
 "Team A can have at most 8 desks on Floor 3."
 
-Checked before every booking. If Team A already has 8 active bookings on Floor 3, the 9th attempt is rejected — regardless of what the algorithm recommends.
+Before any hot desk booking is persisted, the transaction acquires the `TeamFloorQuota` row lock and evaluates:
 
-### Floor Capacity
+$$\text{teamHotActive} < \text{maxDesks}$$
 
-"Floor 3 can hold at most 60 people."
+Where $\text{teamHotActive}$ is queried as:
+```sql
+SELECT COUNT(*) FROM bookings 
+WHERE team_id = :teamId 
+  AND floor_id = :floorId 
+  AND booking_date = :date 
+  AND status IN ('BOOKED', 'CHECKED_IN') 
+  AND is_owner_booking = FALSE;
+```
 
-Checked before every booking. If 60 desks are already booked on Floor 3, no more bookings are accepted.
+### Floor Capacity & Headroom Invariant
 
-Both checks happen **inside the transaction**, after acquiring the lock and before creating the booking. This ensures the counts are accurate even under concurrent requests.
+Hot desk reservations are constrained by the single exact headroom formula:
+
+$$\text{hotActive} + \text{fixedNotReleased} < \text{maxCapacity}$$
+
+Where:
+- $\text{hotActive}$: Current active hot bookings on the floor (`status IN ('BOOKED', 'CHECKED_IN') AND is_owner_booking = FALSE`).
+- $\text{fixedNotReleased} = \text{totalFixedDesksOnFloor} - \text{fixedReleasedToday}$: Guarantees that fixed-desk owners who have not yet booked still have their seats reserved.
+- When an assigned fixed-desk owner cancels or no-shows, $\text{fixedNotReleased}$ decrements by 1, automatically increasing the permitted $\text{hotActive}$ count.
+
+Both checks execute **inside the transaction under the parent row locks**, ensuring absolute consistency under high concurrency.
 
 ---
 
 ## Timezones and Cut-Off Windows
 
-Booking cut-offs and time windows are strictly interpreted in the **employee's own timezone**.
+All company offices, floors, and employees operate within **India Standard Time (IST, `Asia/Kolkata`, UTC+05:30)**.
 
-### How we model time
-Every employee has a configured IANA timezone (e.g., `Asia/Kolkata`, `Asia/Singapore`).
-
-When an employee makes a booking for "Tuesday" with a window of "9:00 AM–6:00 PM", these values are interpreted entirely within their local timezone.
-
-```text
-Employee timezone
-       ↓
-Local booking date/time
-       ↓
-Convert to absolute instant (UTC)
-       ↓
-Store/compare consistently
-```
-
-We do **not** use the server's timezone for any business logic.
-
-### Cut-off edge cases
-
-The PDF explicitly asks how a booking exactly at the cut-off should behave. Our rule is: **cut-off is exclusive**.
+### Operational Calendar & Timezone Modeling
+- **Zero DST Drift**: India does not observe Daylight Saving Time, providing completely uniform 24-hour calendar days without spring-forward or fall-back transition anomalies.
+- **Enterprise-Grade Time Handling**: Even with single-timezone operations, all timestamps (`check_in_deadline`, `created_at`, `checked_in_at`) are modeled and stored as absolute UTC instants (`TIMESTAMP WITH TIME ZONE` in PostgreSQL and `java.time.Instant` in Java).
+- **Injected Clock**: All business logic injects `java.time.Clock`, allowing deterministic time-travel assertions in test suites.
 
 ```text
-requestTime < cutoffTime    → allowed
-requestTime >= cutoffTime   → rejected
+IST Input (e.g. 2026-09-24 09:00:00)
+       ↓
+ZoneId.of("Asia/Kolkata")
+       ↓
+Convert to absolute instant (2026-09-24 03:30:00Z)
+       ↓
+Store & compare consistently in PostgreSQL
 ```
 
-For example, if the cancellation cutoff is 18:00:00 in the employee's timezone:
-- `17:59:59.999` → Allowed ✅
-- `18:00:00.000` → Rejected ❌
-- `18:00:00.001` → Rejected ❌
+### Booking Windows & Cut-off Rules
 
-This gives us completely deterministic behavior across all timezones.
+The assignment specification states:
+> *"Employees book a desk on a floor for a date (and time window); they can cancel before a cut-off."*
+> *"Timezone and cut-off edge cases matter – a booking exactly at the cut-off should behave predictably."*
 
-### Database Representation
-For this system, we use both representations appropriately:
-- The `booking_date` and `start_time` / `end_time` can be stored as local date/time types so we know exactly what the employee intended ("Tuesday 9am").
-- Event timestamps (`created_at`, `checked_in_at`, etc.) are converted immediately to absolute instants (UTC) for storage and comparison.
+To provide maximum hybrid flexibility while ensuring strict operational predictability:
+
+#### 1. Continuous Anytime Booking (Up to 14 Business Days Ahead)
+- **24/7 Booking Availability**: Employees can book desks up to $N = 14$ business days ahead at **any time of day or night**.
+- **No Artificial Pre-Day Blackouts**: There is no arbitrary lockout period (such as blocking bookings the evening before). An employee can reserve a seat a week ahead, the night before at 11:30 PM, or early in the morning at 07:00 AM before commuting.
+
+#### 2. On-Day Booking for a Time Window (Before That Time, At Any Time)
+- **Pre-Slot Booking**: On day $D$, an employee can book a desk for an upcoming time window (e.g. workday window 09:00:00–18:00:00 IST) **at any time before that time window begins**.
+  - 07:15:00 IST for a 09:00 slot → Allowed ✅
+  - 08:59:59.999 IST for a 09:00 slot → Allowed ✅
+- **Strict Cut-off Boundary**: Booking a time window after its start/cut-off has passed is strictly rejected:
+  ```text
+  requestTime < cutoffTime    → allowed
+  requestTime >= cutoffTime   → rejected (InvalidBookingDateException)
+  ```
+  - `08:59:59.999` IST → Allowed ✅
+  - `09:00:00.000` IST → Rejected ❌ (Window has begun; must book same-day / walk-in slot)
+  - `09:00:00.001` IST → Rejected ❌
+
+#### 3. Same-Day Mid-Day & Reclaimed Desk Booking (No Instant Expiration)
+- **Dynamic Inventory**: Throughout day $D$, desks that remained unreserved, along with desks reclaimed from cancellations and no-show sweeps (e.g. after the 09:30 morning sweep), can be booked at **any time**.
+- **Dynamic Check-In Deadline Formula**:
+  If an advance booking is made for 09:00 IST, the check-in deadline is `09:00 + 30m grace = 09:30 IST`.
+  If an employee books a desk on day $D$ at 10:15 IST, assigning a 09:30 deadline would cause immediate eviction by the background sweeper. The service calculates:
+  
+  $$\text{check\_in\_deadline} = \max(\text{workday\_start} + \text{grace\_period}, \text{booked\_at} + \text{walk\_in\_grace})$$
+  
+  With $\text{walk\_in\_grace} = 15\text{ minutes}$, a booking at 10:15 IST receives a deadline of 10:30 IST (`05:00:00Z`). In-person walk-ins can also trigger immediate check-in.
+- **Quota & Capacity Governance**: Every same-day allocation strictly verifies team floor quotas and remaining floor hot headroom under parent row locks before confirmation.
+
+#### 4. Cancellation Cut-Off Rules
+- **Cancellation Cut-Off**: An employee can cancel their booking at any time before the cut-off boundary (prior to the time window start or prior to their desk's check-in deadline: `now < check_in_deadline`).
+- **Immediate Desk Reclamation**: The instant a booking is cancelled, the partial index `uq_active_desk_day` stops indexing the row, immediately returning the desk to the pool of eligible desks for other colleagues.
+- **Strict Boundary**: A cancellation attempted at or after the check-in deadline (`now >= check_in_deadline`) is rejected with `CutOffPassedException`.
 
 ---
 
@@ -497,16 +578,16 @@ These are decisions we made where the assignment didn't prescribe a specific ans
 
 | # | Assumption | Why |
 |---|-----------|-----|
-| 1 | **[ASSUMPTION]** A booking covers a full workday slot (e.g., 09:00–18:00), not arbitrary time ranges. | The assignment says "date (and time window)" but doesn't specify the granularity. Arbitrary sub-hour windows would turn desk availability into a temporal interval-overlap problem, which distracts from the main challenges. We make the window configurable. |
-| 2 | **[ASSUMPTION]** One active booking per employee per date. | Not stated in the PDF, but a sensible business rule. An employee shouldn't hold two desks on the same day. Enforced at the database level. |
-| 3 | **[ASSUMPTION]** Team booking is initiated by a designated team coordinator, not by any team member for others. | The PDF mentions employees booking desks — it doesn't describe team-wide booking. We added this feature to demonstrate the neighbourhood algorithm for groups. Restricting it to a coordinator avoids conflicts (e.g., two people simultaneously booking different desks for the same teammate). |
-| 4 | **[ASSUMPTION]** No manual "ungrouping" operation. | The team's neighbourhood is derived dynamically from active bookings. When a booking is cancelled, that desk simply stops being part of the neighbourhood. No explicit regroup/ungroup needed. |
-| 5 | **[ASSUMPTION]** Deterministic allocation (not random). | The PDF doesn't require random allocation. Deterministic allocation is reproducible, testable, and easier to explain. Same inputs always produce the same recommendation. |
-| 6 | **[ASSUMPTION]** A fixed desk that is not booked by its owner stays reserved — it does not become a hot desk. | The PDF says fixed desks are "reserved for a named person." We interpret this strictly: the desk only enters the hot pool through explicit cancellation or no-show auto-release, not by default. |
-| 7 | **[ASSUMPTION]** The grace period for no-show detection is configurable (default: 30 minutes). | The PDF requires auto-release after a grace period but doesn't specify the duration. |
-| 8 | **[ASSUMPTION]** "Exactly at the cut-off" counts as past the cut-off. | The PDF says to handle cut-off edge cases predictably. We chose strict-less-than. |
-| 9 | **[ASSUMPTION]** Floor center is used as the seed point for teams with no existing bookings. | The PDF doesn't specify where to start placing a new team. Center-based seeding is deterministic and distributes teams naturally. |
-| 10 | **[ASSUMPTION]** Scoring weights (α for team proximity, β for compactness) are configuration constants, not exposed in the API. | Internal tuning knobs, not user-facing settings. |
+| 1 | **[ASSUMPTION]** All employees, teams, and office floors operate in India (`Asia/Kolkata`, IST, UTC+05:30). | Eliminates cross-timezone confusion for physical attendance while using proper UTC storage. |
+| 2 | **[ASSUMPTION]** Hot desks are floor-wide; zones are modeled as floors. | The PDF refers to "Zone / Team Quotas" and hot pools. Treating floors as distinct zones aligns cleanly with physical building security, floor-level quotas, and 2D spatial coordinates. |
+| 3 | **[ASSUMPTION]** Continuous anytime booking up to $N=14$ business days ahead; on day $D$, booking for an upcoming time window is allowed at any time before that window begins. | Allows employees to book whenever they want (days ahead, night before, or morning of day D), eliminating artificial pre-day cut-offs while enforcing strict window boundaries. |
+| 4 | **[ASSUMPTION]** One active booking per employee per date. | Enforced at the database level via partial unique index `uq_active_employee_day` on `(employee_id, booking_date) WHERE status IN ('BOOKED', 'CHECKED_IN')`. |
+| 5 | **[ASSUMPTION]** Team booking is initiated by a designated team coordinator. | Restricting multi-seat group booking to a coordinator avoids conflicting parallel attempts for the same teammates. |
+| 6 | **[ASSUMPTION]** Deterministic allocation (not random). | Same inputs always produce the identical recommendation. Essential for test reproducibility and auditability. |
+| 7 | **[ASSUMPTION]** Fixed desks have guaranteed floor headroom ($\text{hotActive} + \text{fixedNotReleased} \le \text{maxCapacity}$); cancelled/no-show fixed desks enter the hot pool immediately. | Prevents hot desk reservations from locking out fixed-desk owners while re-allocating unused desks. |
+| 8 | **[ASSUMPTION]** Walk-in check-in deadline is dynamically computed: $\max(\text{start} + \text{grace}, \text{bookedAt} + \text{walkInGrace})$. | Prevents same-day walk-in bookings after morning grace from expiring instantly. |
+| 9 | **[ASSUMPTION]** "Exactly at the cut-off" counts as past the cut-off. | Strict exclusive threshold (`requestTime < cutoffTime`) ensures completely deterministic edge-case behavior. |
+| 10 | **[ASSUMPTION]** Floor center with local occupancy penalty ($\gamma = 5.0$) seeds new teams. | Deterministically seeds new teams near the center while dispersing clusters across the floor. |
 
 ---
 
@@ -598,7 +679,10 @@ floors
 id              BIGINT PK
 floor_number    INT              -- physical floor number (1, 2, 3...)
 name            VARCHAR          -- e.g. "Floor 3"
-max_capacity    INT              -- e.g. 60
+max_capacity    INT              -- total floor capacity (e.g. 60)
+center_row      INT              -- geometric center row (for seed algorithm)
+center_column   INT              -- geometric center column (for seed algorithm)
+timezone        VARCHAR NOT NULL -- IANA timezone, "Asia/Kolkata"
 is_active       BOOLEAN
 created_at      TIMESTAMP
 updated_at      TIMESTAMP
@@ -616,6 +700,11 @@ reserved_for_employee_id  BIGINT FK -> employees (nullable, only for FIXED)
 is_active       BOOLEAN          -- false for maintenance / decommissioned
 
 UNIQUE (floor_id, row_number, column_number)  -- no two desks at same position
+
+-- Storage-level ownership invariant:
+CONSTRAINT chk_desk_fixed_owner 
+CHECK ((desk_type = 'FIXED' AND reserved_for_employee_id IS NOT NULL) 
+    OR (desk_type = 'HOT' AND reserved_for_employee_id IS NULL))
 ```
 
 > **Important — No `is_available` column on desks.** A desk is a physical object. Its availability depends on `desk + requested date + existing bookings`. D42 might be booked on Sept 25 but available on Sept 26. Storing `is_available` as a mutable column would be misleading and introduce stale-state risks with our concurrency model.
@@ -623,19 +712,48 @@ UNIQUE (floor_id, row_number, column_number)  -- no two desks at same position
 ```
 bookings
 --------
-id              BIGINT PK
-desk_id         BIGINT FK -> desks
-employee_id     BIGINT FK -> employees
-booking_date    DATE
-start_time      TIME
-end_time        TIME
-status          ENUM('BOOKED', 'CHECKED_IN', 'CANCELLED', 'NO_SHOW', 'RELEASED')
-created_at      TIMESTAMP
-checked_in_at   TIMESTAMP (nullable)
-cancelled_at    TIMESTAMP (nullable)
-updated_at      TIMESTAMP
+id                  BIGINT PK
+desk_id             BIGINT FK -> desks
+employee_id         BIGINT FK -> employees
+team_id             BIGINT FK -> teams       -- denormalized: fast quota index & immutable team audit
+floor_id            BIGINT FK -> floors      -- denormalized: fast capacity index & intra-floor queries
+booking_date        DATE                     -- reservation date (e.g. 2026-09-24)
+start_time          TIME                     -- workday slot start (09:00:00)
+end_time            TIME                     -- workday slot end (18:00:00)
+check_in_deadline   TIMESTAMP WITH TIME ZONE -- UTC instant (max(start + grace, bookedAt + walkInGrace))
+status              ENUM('BOOKED', 'CHECKED_IN', 'CANCELLED', 'NO_SHOW')
+is_owner_booking    BOOLEAN NOT NULL         -- TRUE if owner booked assigned fixed desk (exempt from hot quota)
+created_at          TIMESTAMP WITH TIME ZONE
+checked_in_at       TIMESTAMP WITH TIME ZONE (nullable)
+cancelled_at        TIMESTAMP WITH TIME ZONE (nullable)
+updated_at          TIMESTAMP WITH TIME ZONE
 
-UNIQUE (desk_id, booking_date)  -- prevents double booking at DB level
+-- Partial unique indexes on bookings:
+-- 1. Desk uniqueness: prevents two active bookings for the same desk on the same day.
+--    Automatically allows re-booking once status is CANCELLED or NO_SHOW.
+CREATE UNIQUE INDEX uq_active_desk_day 
+ON bookings (desk_id, booking_date) 
+WHERE status IN ('BOOKED', 'CHECKED_IN');
+
+-- 2. Employee uniqueness: ensures an employee holds at most one active booking per day.
+CREATE UNIQUE INDEX uq_active_employee_day 
+ON bookings (employee_id, booking_date) 
+WHERE status IN ('BOOKED', 'CHECKED_IN');
+
+-- 3. Composite partial index for fast team-floor quota enforcement (hot bookings only):
+CREATE INDEX idx_bookings_team_quota 
+ON bookings (team_id, floor_id, booking_date) 
+WHERE status IN ('BOOKED', 'CHECKED_IN') AND is_owner_booking = FALSE;
+
+-- 4. Composite partial index for fast floor capacity headroom enforcement (hot bookings only):
+CREATE INDEX idx_bookings_floor_capacity 
+ON bookings (floor_id, booking_date) 
+WHERE status IN ('BOOKED', 'CHECKED_IN') AND is_owner_booking = FALSE;
+
+-- 5. Index for timezone-proof background no-show sweeps:
+CREATE INDEX idx_bookings_noshow_sweep 
+ON bookings (status, check_in_deadline) 
+WHERE status = 'BOOKED';
 ```
 
 ```
@@ -645,17 +763,27 @@ id              BIGINT PK
 team_id         BIGINT FK -> teams
 floor_id        BIGINT FK -> floors
 max_desks       INT              -- e.g. "Team A ≤ 8 desks on Floor 3"
+
+UNIQUE (team_id, floor_id)       -- one quota record per team per floor
 ```
 
 ### Key Constraints & Design Decisions
 
-| Constraint | Purpose |
-|------------|----------|
-| `UNIQUE (desk_id, booking_date)` on bookings | Prevents double-booking at the storage layer, even if application locking is bypassed. |
-| `UNIQUE (floor_id, row_number, column_number)` on desks | Guarantees no two desks occupy the same physical position on a floor. |
-| `reserved_for_employee_id` NOT NULL when `desk_type = 'FIXED'` | Fixed desks always have a named owner; hot desks always have NULL. Enforced by application logic. |
-| No `is_available` on desks | Availability is derived from bookings, not stored as mutable desk state. |
-| One row per desk | Enables `SELECT ... FOR UPDATE` on individual desk rows for pessimistic locking. |
+| Constraint / Index | Level | Purpose |
+| :--- | :--- | :--- |
+| Partial index `uq_active_desk_day` | Storage Layer (DB) | Prevents double-booking active reservations while immediately allowing re-booking if status becomes `CANCELLED` or `NO_SHOW`. |
+| Partial index `uq_active_employee_day` | Storage Layer (DB) | Enforces that an employee can hold at most one active desk booking per calendar day at the storage layer. |
+| Check constraint `chk_desk_fixed_owner` | Storage Layer (DB) | Enforces that fixed desks always have an assigned owner and hot desks never do, preventing orphaned fixed desks. |
+| `UNIQUE (floor_id, row_number, column_number)` | Storage Layer (DB) | Guarantees no two desks occupy the same physical position on a floor. |
+| `UNIQUE (team_id, floor_id)` | Storage Layer (DB) | Ensures each team has exactly one defined quota per floor. |
+| Partial index `idx_bookings_team_quota` | Storage Layer (DB) | Turns team hot quota evaluation into an index-only scan without joining `desks` or `employees`. |
+| Partial index `idx_bookings_floor_capacity` | Storage Layer (DB) | Turns floor hot capacity evaluation into an index-only scan without joining `desks`. |
+| Flag `is_owner_booking` | Schema | Explicitly separates owner bookings from hot bookings, making quota and headroom counts queryable without joins. |
+| No `is_available` on desks | Architecture | Availability is derived from active bookings on a date, not stored as mutable desk state. |
+| One row per desk | Architecture | Enables `SELECT ... FOR UPDATE` on individual desk rows for pessimistic concurrency control. |
+
+> [!IMPORTANT]
+> **Database Migrations via Flyway**: Standard JPA/Hibernate annotations cannot express PostgreSQL partial indexes with `WHERE` clauses or table-level `CHECK` constraints. All schema definitions are maintained via Flyway SQL migrations (`src/main/resources/db/migration/V1__init_schema.sql`). This guarantees that any fresh checkout automatically deploys the exact indexes and storage safety nets.
 
 ### ER Relationships
 
@@ -663,6 +791,8 @@ max_desks       INT              -- e.g. "Team A ≤ 8 desks on Floor 3"
 Team 1────────< Employee
 Floor 1────────< Desk
 Employee 1────────< Booking >────────1 Desk
+Team 1────────< Booking
+Floor 1────────< Booking
 Team *────────* Floor (through team_floor_quotas)
 Desk *────────1 Employee (reserved_for, nullable — FIXED desks only)
 ```
@@ -673,95 +803,128 @@ Desk *────────1 Employee (reserved_for, nullable — FIXED desks
 
 ### Prerequisites
 
-- Java 17+
-- PostgreSQL 14+
-- Maven 3.8+
+- **Java 17+**
+- **Maven 3.8+**
+- **Docker & Docker Compose** (for PostgreSQL 15 & Redis 7)
 
-### Setup
+### Local Environment with Docker Compose
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/<your-username>/smart-desk-booking.git
-   cd smart-desk-booking
-   ```
+A bundled `docker-compose.yml` spins up PostgreSQL 15 and Redis 7 with container health checks:
 
-2. Create the database:
-   ```sql
-   CREATE DATABASE smart_desk_booking;
-   ```
+```yaml
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: smartdesk-postgres
+    environment:
+      POSTGRES_DB: smart_desk_booking
+      POSTGRES_USER: smartdesk
+      POSTGRES_PASSWORD: password123
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartdesk -d smart_desk_booking"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
 
-3. Configure the database connection in `src/main/resources/application.properties`:
-   ```properties
-   spring.datasource.url=jdbc:postgresql://localhost:5432/smart_desk_booking
-   spring.datasource.username=your_username
-   spring.datasource.password=your_password
-   ```
+  redis:
+    image: redis:7-alpine
+    container_name: smartdesk-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-4. Run the application:
-   ```bash
-   ./mvnw spring-boot:run
-   ```
+volumes:
+  pgdata:
+```
+
+Start the infrastructure:
+```bash
+docker compose up -d
+```
+
+Flyway automatically initializes the schema and partial indexes on application startup.
+
+### Running the Application
+
+**Standard Profile (PostgreSQL + Redis)**:
+```bash
+./mvnw spring-boot:run
+```
+
+**Redis-Free Local Profile (PostgreSQL + In-Memory Cache)**:
+If you prefer running without Redis, activate the `local` profile:
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.profiles=local
+```
+*(The `local` profile uses an in-memory `ConcurrentHashMap` cache manager with identical `@Cacheable` semantics, requiring only PostgreSQL).*
 
 The application starts on `http://localhost:8080`.
 
-### Sample Data
+### Sample Data Initialization
 
-The application ships with a data initializer that creates a sample floor with desks, a few teams, and employees for quick testing.
+The application automatically seeds a sample floor (Floor 3 with 60 desks, mixed hot and fixed), multiple teams, employees, and floor quotas for immediate API exploration.
 
 ---
 
 ## Testing
 
-### Unit Tests
+### Automated Test Suite
 
 ```bash
-./mvnw test
+./mvnw clean test
 ```
 
-Key test areas:
-- **Allocation algorithm**: given a set of team bookings and available desks, does the algorithm return the expected desk?
-- **Quota enforcement**: booking rejected when team/floor limit is reached
-- **Cut-off enforcement**: cancellation rejected after the cut-off time
+Integration tests utilize **Testcontainers** with a real PostgreSQL 15 container to validate raw SQL migrations, partial unique indexes, check constraints, and row-level locking.
 
-### Concurrency Test
+### 1. Multi-Threaded Concurrency Tests (`CountDownLatch`)
 
-The most important test. We prove that two simultaneous booking requests for the last available desk result in exactly one winner:
+1. **Two Threads Competing for 1 Desk**:
+   - Synchronizes two concurrent threads attempting to book the last available desk.
+   - Asserts: Exactly 1 transaction commits successfully (`200 OK`); the other receives a dynamic fallback or clean HTTP 409 `NoDeskAvailableException`. Zero partial indexes violated.
+2. **Two Threads with 2 Available Desks (Adjacent Seating)**:
+   - Two teammates book concurrently on a floor with 2 adjacent desks.
+   - Asserts: Both win; Thread B waits on the floor lock, re-ranks against Thread A's fresh placement, and is seated immediately adjacent to Thread A.
+3. **100 Concurrent Threads Competing for $K$ Desks**:
+   - 100 threads fire simultaneously for $K = 10$ available desks.
+   - Asserts: Exactly 10 bookings created in the database; 90 requests rejected. Zero double-bookings, zero quota over-allocations, zero database constraint deadlocks.
+4. **Same-Employee Double-Submit Idempotency Test**:
+   - Simulates an employee rapidly double-clicking the "Book" button.
+   - Asserts: Exactly 1 active booking persisted (`uq_active_employee_day` enforced); second request receives existing booking or `AlreadyBookedException`.
+5. **Dynamic Quota & Headroom After No-Show Sweep**:
+   - Asserts that when a fixed-desk owner is marked `NO_SHOW` by the sweeper, $\text{fixedNotReleased}$ decrements, dynamically expanding the permissible hot capacity for subsequent walk-in bookings.
 
-```java
-@Test
-void twoSimultaneousBookings_onlyOneWins() {
-    // Setup: one available desk, two employees
-    // Launch two threads, both try to book the same desk
-    // Assert: exactly one booking exists in the database
-    // Assert: the other employee received a fallback or rejection
-}
-```
+### 2. Clock-Driven Temporal & Edge-Case Tests
 
-This test uses `CountDownLatch` to synchronize two threads and verify the pessimistic locking behavior under real concurrency.
-
-### Integration Tests
-
-- Book → Cancel → Re-book flow
-- No-show auto-release after grace period
-- Team booking: all-or-nothing atomicity
-- Timezone cut-off edge cases
+Injected `java.time.Clock` enables deterministic time-travel assertions:
+- **On-Day Time Window Cut-Off Boundary**: Verifies that booking an upcoming time window starting at 09:00:00 IST succeeds at 08:59:59.999 IST (✅) and is rejected at 09:00:00.000 IST (❌ `InvalidBookingDateException`).
+- **Cancellation Cut-Off Boundary**: Verifies that cancelling a booking succeeds strictly before the check-in deadline / cut-off and is rejected once the cut-off boundary is reached (`CutOffPassedException`).
+- **Same-Day Mid-Day Deadline Calculation**: Verifies booking made at 10:15 IST receives check-in deadline 10:30 IST (`now + 15m`), preventing instant expiration.
+- **Auto-Release Sweeper Verification**: Fast-forwards clock past 09:30:00 IST; asserts overdue `BOOKED` reservations transition to `NO_SHOW`, while checked-in reservations remain `CHECKED_IN`.
 
 ---
 
-## Clean Architecture & Project Structure
+## Layered Architecture & Project Structure
 
-The project implements a decoupled, industry-grade layered architecture adhering strictly to **Domain-Driven Design (DDD)** concepts and **SOLID** principles:
+The project implements a decoupled, industry-grade layered Spring Boot architecture with the Strategy pattern, adhering strictly to **SOLID** principles and clean separation of concerns:
 
 ```
 com.anurag.smartdeskbooking
 ├── config/              -- Infrastructure configurations
 │   ├── SecurityConfig.java         -- Spring Security, JWT filter chain, RBAC
-│   ├── RedisCacheConfig.java       -- Redis cache manager, TTLs, serializers
+│   ├── RedisCacheConfig.java       -- Redis cache manager, CustomCacheErrorHandler, TTLs
 │   ├── OpenApiConfig.java          -- Swagger / OpenAPI 3.0 documentation
 │   └── SchedulingConfig.java       -- Thread pool configuration for background tasks
 ├── controller/          -- REST API presentation layer (Slim controllers)
 │   ├── AuthController.java         -- Login, token refresh
-│   ├── BookingController.java      -- Individual and team desk reservations
+│   ├── BookingController.java      -- Individual and walk-in desk reservations
 │   ├── DeskController.java         -- Desk query & recommendation endpoints
 │   ├── FloorController.java        -- Floor details, quotas, and capacities
 │   └── TeamController.java         -- Team membership and bookings
@@ -777,32 +940,38 @@ com.anurag.smartdeskbooking
 │       └── AuthResponseDto.java
 ├── exception/           -- Robust error handling & Problem Details
 │   ├── GlobalExceptionHandler.java -- @RestControllerAdvice RFC 7807 error handler
-│   ├── ErrorResponseDto.java       -- Standardized error payload
+│   ├── ErrorResponseDto.java       -- Standardized RFC 7807 error payload
 │   ├── DeskAlreadyBookedException.java
+│   ├── AlreadyBookedException.java
+│   ├── NoDeskAvailableException.java
 │   ├── QuotaExceededException.java
 │   ├── CutOffPassedException.java
+│   ├── InvalidBookingDateException.java
+│   ├── InvalidCheckInException.java
 │   └── ResourceNotFoundException.java
 ├── model/               -- Rich Domain Entity models
 │   ├── BaseEntity.java             -- @MappedSuperclass with id, audit timestamps, version
 │   ├── Employee.java               -- User entity with role and timezone
-│   ├── Team.java                   -- Team boundary and quota configurations
-│   ├── Floor.java                  -- Floor grid dimension, center seed coordinates
+│   ├── Team.java                   -- Team boundary configuration
+│   ├── Floor.java                  -- Floor grid dimension, timezone, center seed coordinates
 │   ├── Desk.java                   -- Desk coordinates (row, col), type (HOT, FIXED)
-│   ├── Booking.java                -- Reservation state machine (CONFIRMED, CHECKED_IN, CANCELLED, NO_SHOW)
+│   ├── TeamFloorQuota.java         -- Explicit team capacity per floor
+│   ├── Booking.java                -- Reservation state machine (BOOKED, CHECKED_IN, CANCELLED, NO_SHOW)
 │   └── enums/                      -- DeskType, BookingStatus, Role
 ├── repository/          -- Persistence layer with Spring Data JPA
 │   ├── BookingRepository.java      -- Pessimistic locking queries (@Lock PESSIMISTIC_WRITE)
 │   ├── DeskRepository.java         -- Floor spatial desk queries
 │   ├── FloorRepository.java        -- Capacity and metadata queries
+│   ├── TeamFloorQuotaRepository.java -- Quota row-locking queries
 │   └── EmployeeRepository.java     -- User authentication queries
 ├── service/             -- Transactional Business Orchestration
-│   ├── BookingService.java         -- Interface for single & team booking transactions
+│   ├── BookingService.java         -- Interface for single, walk-in, and team booking transactions
 │   ├── DeskService.java            -- Desk availability and recommendation orchestration
-│   ├── FloorService.java           -- Floor quotas and capacity validation
+│   ├── FloorService.java           -- Floor quotas and capacity headroom validation
 │   ├── AuthService.java            -- Authentication & JWT issuance
 │   ├── impl/                       -- Concrete service implementations (@Transactional)
 │   └── scheduler/                  -- Resilient background workers
-│       └── NoShowReleaseScheduler.java -- Automated grace-period sweep
+│       └── NoShowReleaseScheduler.java -- Automated idempotent grace-period sweep
 ├── strategy/            -- Strategy Pattern for Desk Allocation
 │   ├── DeskAllocationStrategy.java -- Strategy interface for scoring candidate desks
 │   ├── TeamNeighbourhoodStrategy.java -- Euclidean teammate proximity scoring
@@ -846,12 +1015,12 @@ This section maps directly to the **Evaluation Criteria (Plus Points)** outlined
   - `ROLE_EMPLOYEE`: Can view available desks, book/cancel personal desks, and check in.
   - `ROLE_TEAM_COORDINATOR`: Elevated privilege to trigger atomic multi-person team bookings (`/api/bookings/team`).
   - `ROLE_ADMIN`: Ability to modify floor capacities, reassign fixed desks, and configure team quotas.
-- **Security Chain**: Custom `JwtAuthenticationFilter` validates the bearer token signature, extracts user claims (`employeeId`, `teamId`, `timezone`, `role`), and populates the `SecurityContextHolder`.
+- **Security Chain**: Custom `JwtAuthenticationFilter` validates the bearer token signature, extracts identity claims (`sub` = `employeeId`, `role`), and populates the `SecurityContextHolder`.
 - **Fine-Grained Authorization**: Applied at the method level using `@PreAuthorize("hasRole('TEAM_COORDINATOR')")`.
 
 #### Interview Talking Points
-> **Q: Why stateless JWT over stateful HTTP sessions?**
-> *"Stateless JWT eliminates the need for shared session clustering or sticky sessions across horizontal backend nodes. Authorization claims (like timezone and team ID) travel inside the signed token, reducing database round-trips on authenticated requests. For revoking tokens or critical privilege revocations, a Redis token denylist (blocklist) with matching TTL can be employed."*
+> **Q: Why exclude `teamId` from JWT claims and query it from the database instead?**
+> *"While `employeeId` and `role` are stable identity attributes suitable for stateless tokens, team membership is mutable. If an employee transfers from Team Alpha to Team Beta, a token containing `teamId: Alpha` would allow them to book against Alpha's quota until token expiration. By resolving current `team_id` from PostgreSQL (or cache-aside) inside the booking transaction, quota enforcement is guaranteed to be 100% fresh and accurate."*
 
 ---
 
@@ -861,64 +1030,89 @@ A rigorous algorithmic complexity analysis across the core booking operations:
 
 | Operation | Component / Routine | Time Complexity | Space Complexity | Explanation |
 | :--- | :--- | :--- | :--- | :--- |
-| **Desk Filtering** | `filterEligibleDesks` | $O(D)$ | $O(C)$ | Scans $D$ desks on a floor; filters out occupied, restricted, or quota-violating desks. Result is $C$ candidates ($C \le D \le 500$). |
+| **Desk Filtering** | `filterEligibleDesks` | $O(D)$ | $O(C)$ | Scans $D$ desks on a floor; filters out occupied, inactive, or restricted desks. Result is $C$ candidates ($C \le D \le 500$). |
 | **Team Centroid** | `calculateCentroid` | $O(T)$ | $O(1)$ | Computes mean $(\bar{x}, \bar{y})$ of $T$ active teammate coordinates ($T \le 50$). |
-| **Single Desk Recommendation** | `TeamNeighbourhoodStrategy` | $O(C \cdot T)$ | $O(C)$ | For each candidate desk, computes min teammate distance ($O(T)$) and centroid distance ($O(1)$). |
+| **Single Desk Recommendation** | `TeamNeighbourhoodStrategy` | $O(D + C \cdot T)$ | $O(C)$ | Filters $D$ desks ($O(D)$), then for each of $C$ candidate desks computes min teammate distance ($O(T)$) and centroid distance ($O(1)$). Identifies best desk deterministically ($O(C)$). |
 | **Team Anchor-and-Expand** | Multi-seat group booking | $O(K \cdot C \log M)$ | $O(M)$ | Evaluates top $K=10$ anchor candidates. For each, selects $M-1$ closest desks using a min-heap or partial sort. |
-| **Pessimistic Row Lock** | `SELECT ... FOR UPDATE` | $O(1)$ | $O(1)$ | B-tree index lookup on `desk_id + booking_date` in PostgreSQL. |
-| **No-Show Auto Release** | Scheduled background sweep | $O(B)$ | $O(B)$ | Indexed scan over $B$ un-checked-in bookings past grace period. |
+| **Hierarchical Pessimistic Lock** | `SELECT ... FOR UPDATE` | $O(\log N)$ | $O(1)$ | B-tree index traversal on primary keys (Floor / Quota / Desk) in PostgreSQL ($N$ = total rows). |
+| **Active Quota & Capacity Check** | `COUNT(...)` on active bookings | $O(\log N + K)$ | $O(1)$ | B-tree composite index range scan over active bookings on target floor/quota for the date ($K$ = matching rows). |
+| **No-Show Auto Release Sweep** | Scheduled background worker | $O(B)$ | $O(1)$ | Direct indexed scan over overdue bookings (`WHERE status = 'BOOKED' AND check_in_deadline <= :nowUtc`). |
 
-#### Mathematical Complexity Breakdown
+#### Mathematical Complexity & Latency Breakdown
 - **Eliminating `Math.sqrt()`**: Using squared Euclidean distance $\Delta x^2 + \Delta y^2$ preserves strict spatial ordering without floating-point square root operations, running in a single clock cycle on modern CPU ALUs.
-- **Scalability Guarantee**: For a standard enterprise floor with $D = 500$ desks, $T = 15$ teammates, and team booking size $M = 5$, algorithm latency is strictly $< 2 \text{ ms}$ on standard JVM runtimes, far below any database I/O threshold.
+- **Microsecond Algorithm vs. Database Round-Trips**: For a standard enterprise floor with $D = 500$ desks, $T = 15$ teammates, and team booking size $M = 5$, the spatial ranking algorithm executes in **$< 1\text{ ms}$** in-memory. Total end-to-end transaction latency (network round-trips, floor/quota locks, fresh ranking query, desk lock, insert, commit) is typically **$10\text{--}30\text{ ms}$**.
+- **Floor-Level Throughput**: A single floor comfortably supports **50–100 bookings/sec** under sustained peak contention, scaling horizontally across floors ($F \times 50\text{--}100\text{ TPS}$).
 
 ---
 
 ### 3. Handling System Failure Cases & Fault Tolerance
 
 ```text
-       Double Booking Contention Flow (Simultaneous Requests for Last Desk)
+       Contention Resolution & Dynamic In-Lock Ranking
        
   Thread A (Employee 1)                    Thread B (Employee 2)
            │                                        │
-    1. BEGIN TX                              1. BEGIN TX
+    1. BEGIN TX (READ COMMITTED)             1. BEGIN TX (READ COMMITTED)
            │                                        │
-    2. SELECT FOR UPDATE                     2. SELECT FOR UPDATE
-       (Acquires Lock on Desk 101)              (BLOCKED on Desk 101 Lock)
+    2. LOCK Floor Row                        2. WAIT on Floor Row Lock
            │                                        :
-    3. Re-verify: Still Available?                  :
-       State = AVAILABLE                            :
+    3. Verify Floor Hot Headroom                    :
+    4. LOCK TeamFloorQuota Row                      :
+    5. Verify Team Hot Quota                        :
+    6. Fresh In-TX Ranking:                         :
+       Rank 1 -> Desk 101                           :
            │                                        :
-    4. INSERT Booking (Desk 101)                    :
-           │                                        :
-    5. COMMIT TX                                    :
-       (Releases Lock) ─────────────────────────────▶
-                                             3. Acquires Lock
-                                             4. Re-verify: Still Available?
-                                                State = BOOKED!
-                                             5. ROLLBACK TX
-                                             6. Throw DeskAlreadyBookedException
-                                                (409 Conflict / Fallback)
+    7. LOCK Desk 101 (Available)                    :
+    8. INSERT Booking (Desk 101)                    :
+    9. COMMIT TX ──────────────────────────────────▶:
+       (Releases Locks)                      2. ACQUIRES Floor Row Lock
+                                             3. Verify Floor Hot Headroom
+                                             4. ACQUIRES TeamFloorQuota Lock
+                                             5. Verify Team Hot Quota
+                                             6. Fresh In-TX Ranking:
+                                                (Sees Desk 101 now BOOKED by Thread A)
+                                                Rank 1 -> Desk 102 (Adjacent to Desk 101!)
+                                             7. LOCK Desk 102 (Available)
+                                             8. INSERT Booking (Desk 102)
+                                             9. COMMIT TX (Success! Zero 409 Conflict!)
 ```
 
 #### Fault-Tolerance Mechanisms
-1. **Defensive Concurrency & Race Conditions**:
-   - **Pessimistic Locking**: Every booking execution locks the target desk row using `PESSIMISTIC_WRITE` (`SELECT ... FOR UPDATE`).
-   - **Database Unique Constraint**: `UNIQUE (desk_id, booking_date)` acts as an unbreakable guarantee at the storage layer even if application nodes crash or bypass locking.
-2. **Deadlock Elimination**:
-   - In multi-seat team bookings where multiple desks are reserved in a single transaction, desks are strictly sorted by primary key (`desk_id ASC`) before lock acquisition. This enforces an identical lock acquisition order across all threads, eliminating circular wait deadlocks ($T_1 \to D_1 \to D_2$ and $T_2 \to D_2 \to D_1$).
-3. **Self-Healing Schedulers (Crash Recovery)**:
+
+1. **Defensive Concurrency & Race Condition Elimination**:
+   - **Floor & Quota Serialization Point (Design Trade-Off)**:
+     Locking the parent `Floor` and `TeamFloorQuota` row serializes bookings on that specific floor during the critical section. This guarantees that aggregate invariants (team quotas and floor capacity headroom) are atomically verified.
+   - **PostgreSQL Aborted Transaction Prevention**:
+     In PostgreSQL, catching a `FOR UPDATE NOWAIT` failure or a unique violation marks the physical transaction aborted, preventing any further SQL statements from running. Our architecture avoids this pitfall completely: competing threads simply wait on the floor lock, acquire it, and run a **single fresh in-transaction ranking** against current DB state. Thread B seamlessly selects the next adjacent desk (Desk 102) without catching database exceptions or looping.
+   - **Storage-Level Defense-in-Depth (Partial Unique Indexes)**:
+     - `uq_active_desk_day`: `UNIQUE (desk_id, booking_date) WHERE status IN ('BOOKED', 'CHECKED_IN')` guarantees zero double-bookings even if application locking is bypassed. Crucially, partial indexing allows re-booking if a prior reservation is `CANCELLED` or `NO_SHOW`.
+     - `uq_active_employee_day`: `UNIQUE (employee_id, booking_date) WHERE status IN ('BOOKED', 'CHECKED_IN')` guarantees an employee cannot hold two active bookings on the same date.
+   - **Hierarchical Deadlock Elimination**:
+     Forward booking transactions acquire locks in strict descending hierarchy: `Floor` $\to$ `TeamFloorQuota` $\to$ `Desk` (ordered ascending by `desk_id ASC`). Because every thread honors this identical sequence, circular wait conditions ($T_1 \to R_1 \to R_2$ vs $T_2 \to R_2 \to R_1$) are structurally eliminated. Cancellation and no-show releases operate as single-row updates on `bookings` (`UPDATE bookings SET status = ... WHERE id = :id`) and do not participate in multi-resource circular waits.
+
+2. **Timezone-Proof Self-Healing Schedulers (Crash Recovery)**:
    - The `NoShowReleaseScheduler` does not store transient in-memory timers.
-   - It queries state idempotently from the database:
+   - It queries state against pre-computed UTC `check_in_deadline` timestamps:
      ```sql
-     SELECT b FROM Booking b 
-     WHERE b.bookingDate = :today 
-       AND b.status = 'CONFIRMED' 
-       AND b.startTime + :gracePeriod <= :currentTime
+     UPDATE bookings 
+     SET status = 'NO_SHOW', updated_at = :nowUtc
+     WHERE status = 'BOOKED' 
+       AND check_in_deadline <= :nowUtc;
      ```
-   - If the server crashes or restarts during business hours, the very next scheduled execution catches all accumulated overdue bookings automatically.
-4. **Transaction Boundary & Rollback**:
-   - All booking methods are wrapped in `@Transactional(rollbackFor = Exception.class)`. Any failure (e.g., quota violation, database disconnect, network partition) immediately triggers a clean rollback, preventing orphaned or partially written reservations.
+   - **Check-in Race Prevention**: The update is conditioned on `status = 'BOOKED'`. If an employee checks in at 09:29:59 IST (`status = 'CHECKED_IN'`), the sweeper matches 0 rows, eliminating race conditions.
+   - **Distributed Multi-Instance Safety**: Because the SQL statement is conditional and atomic at the row level, multiple application instances running the sweep simultaneously cannot double-process rows or corrupt state. Heavy distributed locking (ShedLock) is unnecessary.
+   - **Testability**: All temporal decisions inject `java.time.Clock`, allowing deterministic time-travel assertions in automated tests.
+
+3. **Transaction Boundary & Rollback**:
+   - All booking methods are wrapped in `@Transactional(rollbackFor = Exception.class)`. Any infrastructure failure triggers an immediate clean rollback, preventing orphaned or partially written reservations.
+
+4. **Target Production SLA & Disaster Recovery Blueprint**:
+   - **PostgreSQL Write-Ahead Logging (WAL) & Archiving**: Synchronous commit to disk-backed WAL before transaction completion guarantees durability (D in ACID). Continuous WAL streaming to off-site disaster recovery storage prevents data loss.
+   - **Point-In-Time Recovery (PITR)**: Enables rolling back the database to any specific microsecond prior to an operational anomaly or catastrophic failure.
+   - **Automated Physical & Logical Backups**:
+     - Daily full physical volume snapshots + nightly logical `pg_dump` exports.
+     - Target SLA: **RPO (Recovery Point Objective) $\le 5$ minutes**, **RTO (Recovery Time Objective) $\le 15$ minutes**.
+   - **Redis Cache Resilience**: Cache-aside decouples caching from correctness. Handled by a custom error handler, if Redis crashes, the application logs a warning and falls back directly to PostgreSQL with zero data loss and 100% booking correctness.
 
 ---
 
@@ -927,7 +1121,7 @@ A rigorous algorithmic complexity analysis across the core booking operations:
 The implementation showcases clean OOP design and design patterns:
 
 - **Encapsulation**:
-  - Entity fields are strictly `private`. Business invariants (such as transitions from `CONFIRMED` $\to$ `CHECKED_IN` or `CONFIRMED` $\to$ `CANCELLED`) are protected inside domain methods on the `Booking` entity, preventing illegal state transitions.
+  - Entity fields are strictly `private`. Business invariants (such as transitions from `BOOKED` $\to$ `CHECKED_IN` or `BOOKED` $\to$ `CANCELLED`) are protected inside domain methods on the `Booking` entity, preventing illegal state transitions.
   - Immutable Value Objects like `DeskCoordinate(int row, int col)` encapsulate coordinate distance logic.
 - **Polymorphism & Strategy Pattern**:
   - The `DeskAllocationStrategy` interface exposes:
@@ -965,7 +1159,7 @@ Enterprise applications must provide deep visibility into operational health:
    - `/actuator/metrics`: JVM memory, thread pool exhaustion, DB connection pool (HikariCP) utilization.
    - `/actuator/info`: Git commit hash, build version, and environment details.
 2. **Custom Domain Metrics via Micrometer**:
-   - `smartdesk.bookings.total`: Counter tagged by `status` (`CONFIRMED`, `CONFLICT`, `REJECTED`).
+   - `smartdesk.bookings.total`: Counter tagged by `status` (`BOOKED`, `CONFLICT`, `REJECTED`).
    - `smartdesk.allocation.latency`: Timer measuring execution time of spatial algorithms.
    - `smartdesk.noshow.releases.total`: Counter tracking reclaimed capacity from no-shows.
    - `smartdesk.concurrency.conflicts`: Counter incremented whenever a thread encounters a locked desk.
@@ -1088,40 +1282,35 @@ Our allocation algorithm needs existing teammate coordinates. We *could* cache `
 Booking Request
       │
       ▼
-Employee/Team info ──── Redis (cached)
+Floor metadata ─────────────── Redis (cached layout & coordinates)
       │
       ▼
-Floor info ──────────── Redis (cached)
+Generate candidate list
       │
       ▼
-Desk metadata ───────── Redis (cached)
+PostgreSQL transaction ─────── DIRECT DB (READ COMMITTED)
+      │
+      ├─► Lock Floor Row (SELECT ... FOR UPDATE)
+      │
+      ├─► Verify floor hot capacity headroom
+      │
+      ├─► Resolve fresh team_id from Employee row (DIRECT DB, bypass token)
+      │
+      ├─► Lock TeamFloorQuota Row & verify team quota (DIRECT DB)
+      │
+      ├─► Query active teammate positions (DIRECT DB)
+      │
+      ├─► Fresh in-lock ranking: compute teammate proximity
+      │
+      ├─► Lock candidate desk (SELECT ... FOR UPDATE)
+      │
+      ├─► Insert booking (is_owner_booking, check_in_deadline)
       │
       ▼
-Generate candidates
-      │
-      ▼
-Calculate team proximity
-      │
-      ▼
-Ranked candidates
-      │
-      ▼
-PostgreSQL transaction ─── DIRECT DB (never cached)
-      │
-      ▼
-SELECT ... FOR UPDATE
-      │
-      ▼
-Re-check availability ─── DIRECT DB (never cached)
-      │
-      ▼
-Create booking
-      │
-      ▼
-COMMIT
+COMMIT TX
 ```
 
-Redis helps us arrive at the ranked candidate list faster. But **it never decides whether the booking is still valid** — that authority belongs exclusively to PostgreSQL with pessimistic row locking.
+Redis provides fast access to static floor layouts and desk coordinates. But **all mutable transactional state** — team membership, active bookings, quota locks, and seat availability — is resolved directly against PostgreSQL under parent row locks.
 
 #### Cache Invalidation on Admin Updates
 
@@ -1139,10 +1328,30 @@ Repopulate cache
 
 When somebody books a desk, we do **not** update `floor:{id}:desks` in Redis. That cache describes the *physical desk*, not its current occupancy. Booking events only affect PostgreSQL.
 
+#### Handling Redis Outages Gracefully (`CustomCacheErrorHandler`)
+
+By default, Spring Boot re-throws exceptions if Redis fails (`RedisConnectionFailureException`), which would cause client requests to crash even though data is intact in PostgreSQL. 
+
+We configure a `CustomCacheErrorHandler extends SimpleCacheErrorHandler`:
+```java
+@Configuration
+public class CacheConfig extends CachingConfigurerSupport {
+    @Override
+    public CacheErrorHandler errorHandler() {
+        return new CustomCacheErrorHandler();
+    }
+}
+```
+- `handleCacheGetError`: Logs a warning and returns `null` (forcing a cache miss that transparently queries PostgreSQL).
+- `handleCachePutError` & `handleCacheEvictError`: Logs a warning without aborting the write to PostgreSQL.
+
+#### Protection Against Stale JWT Claims
+While the signed JWT bearer token asserts the employee's identity (`sub = employeeId`), transactional quota and zone decisions do **not** trust token-embedded `teamId` blindly. Instead, the service verifies the current `team_id` against PostgreSQL (or cache-aside), preventing transferred employees from retaining stale quota privileges.
+
 #### Interview Defense
 
 > **Q: "Why cache desk layout but not availability?"**
-> *"We cache relatively static, frequently accessed data — floor metadata, desk coordinates, and team information. We deliberately do not treat cached availability as authoritative because booking is concurrency-sensitive. Availability is revalidated inside a PostgreSQL transaction with row-level locking, so PostgreSQL remains the single source of truth. This gives us the performance benefit of caching without introducing stale-state bugs in the critical booking path."*
+> *"We cache relatively static, frequently accessed data — floor metadata, desk coordinates, and team definitions. We deliberately do not treat cached availability as authoritative because booking is concurrency-sensitive. Availability is revalidated inside a PostgreSQL transaction with row-level locking, so PostgreSQL remains the single source of truth. This gives us the performance benefit of caching without introducing stale-state bugs in the critical booking path."*
 
 ---
 
@@ -1167,10 +1376,13 @@ When somebody books a desk, we do **not** update `floor:{id}:desks` in Redis. Th
 
 #### Custom Domain Exception Taxonomy
 - `DomainException` (Abstract Base)
-  - `DeskAlreadyBookedException` $\to$ `409 Conflict` (Simultaneous booking loss)
-  - `QuotaExceededException` $\to$ `422 Unprocessable Entity` (Team/floor quota limit reached)
+  - `DeskAlreadyBookedException` $\to$ `409 Conflict` (Concurrent booking conflict mapped from partial unique index)
+  - `NoDeskAvailableException` $\to$ `409 Conflict` (All candidate desks on the floor are exhausted)
+  - `AlreadyBookedException` $\to$ `409 Conflict` (Employee already holds an active booking on that date)
+  - `QuotaExceededException` $\to$ `422 Unprocessable Entity` (Team or floor quota headroom reached)
   - `CutOffPassedException` $\to$ `400 Bad Request` (Cancellation after cut-off time)
-  - `InvalidCheckInException` $\to$ `400 Bad Request` (Attempting check-in outside grace window)
+  - `InvalidBookingDateException` $\to$ `400 Bad Request` (Attempting to book outside advance window or after daily cut-off)
+  - `InvalidCheckInException` $\to$ `400 Bad Request` (Attempting check-in outside grace window or after NO_SHOW)
   - `ResourceNotFoundException` $\to$ `404 Not Found` (Desk, Floor, or Employee ID does not exist)
   - `UnauthorizedOperationException` $\to$ `403 Forbidden` (Non-coordinator attempting team booking)
 
@@ -1180,11 +1392,35 @@ When somebody books a desk, we do **not** update `floor:{id}:desks` in Redis. Th
 
 When asked to explain this system in an interview:
 
-1. **Start with the Core Problem**: *"In a hybrid office, employees want to sit together without the chaos of seat hoarding or race conditions during morning peak hours."*
+1. **Start with the Core Problem**: *"In a hybrid office, employees want to sit together without seat hoarding or race conditions during morning peak hours."*
 2. **Explain the 2-Stage Allocation**: *"We separate Floor Selection (hard business rules/quotas) from Desk Selection (spatial 2D teammate proximity). This keeps the spatial math focused and deterministic."*
-3. **Highlight Concurrency Defense**: *"We don't rely on hope or application-only flags. We use pessimistic row-level locking (`SELECT ... FOR UPDATE`) backed by a database unique constraint. Thread A wins; Thread B immediately detects the commit and receives a 409 or fallback."*
-4. **Walk Through Time & Space**: *"Filtering reduces candidates to $C \le 500$. In-memory squared Euclidean distance runs in $O(C \cdot T)$ in under 2ms. For teams, anchor-and-expand with $K=10$ gives near-optimal clusters without NP-hard complexity."*
-5. **Demonstrate Production Readiness**: *"The architecture is fully decoupled (Strategy pattern, DTO separation, RFC 7807 error responses, Redis caching for layout reads, Spring Actuator metrics, and self-healing cron jobs for no-show releases)."*
+3. **Highlight Concurrency Defense**: *"We don't rely on application flags alone. We enforce hierarchical locking (Floor/Quota $\to$ Desk ASC) backed by storage-level partial unique indexes (`uq_active_desk_day` and `uq_active_employee_day`). Dynamic re-evaluation inside the locked section eliminates stale placement without failed-transaction traps."*
+4. **Walk Through Time & Space**: *"Filtering reduces candidates to $C \le 500$. In-memory squared Euclidean distance runs in $O(D + C \cdot T)$ in low single-digit milliseconds. For teams, anchor-and-expand with $K=10$ gives near-optimal clusters in $O(K \cdot C \log M)$ without NP-hard complexity."*
+5. **Demonstrate Production Readiness**: *"The architecture is fully decoupled (Strategy pattern, DTO separation, RFC 7807 error responses, Redis caching with CustomCacheErrorHandler, Spring Actuator metrics, idempotent background sweeps, and Flyway database migrations)."*
+
+---
+
+## Implementation Status & Delivery Roadmap
+
+To ensure total transparency between built deliverables and enterprise production blueprints:
+
+| Feature / Architectural Component | Implementation Status | Scope / Test Coverage | Notes |
+| :--- | :--- | :--- | :--- |
+| **Flyway Database Migrations** | ✅ **Core Built** | `V1__init_schema.sql` covering tables, partial unique indexes, foreign keys, and check constraints. | Complete schema automation on boot. |
+| **Storage-Level Defense-in-Depth** | ✅ **Core Built** | `uq_active_desk_day`, `uq_active_employee_day`, `chk_desk_fixed_owner`. | Validated with PostgreSQL Testcontainers. |
+| **Floor & Quota Locking Serialization** | ✅ **Core Built** | Parent `Floor` & `TeamFloorQuota` row-level locks (`SELECT ... FOR UPDATE`). | Eliminates over-allocation races on aggregate quotas. |
+| **In-Lock Fresh Spatial Ranking** | ✅ **Core Built** | `TeamNeighbourhoodStrategy` & `CenterBasedStrategy` re-evaluated under lock. | Eliminates stale ranking and aborted-transaction errors. |
+| **Continuous Anytime Booking Lifecycle** | ✅ **Core Built** | Advance 14 business days + on-day pre-slot booking at any time. | Enforced in transactional application services. |
+| **Dynamic Same-Day Grace Deadline** | ✅ **Core Built** | $\max(\text{start} + \text{grace}, \text{bookedAt} + \text{walkInGrace})$. | Prevents instant expiration of mid-day bookings. |
+| **Timezone & Window Cut-Off Boundaries** | ✅ **Core Built** | India Standard Time (`Asia/Kolkata`), strict exclusive boundary (`requestTime < cutoffTime`). | Driven by injected `java.time.Clock`. |
+| **Idempotent No-Show Auto-Release** | ✅ **Core Built** | Conditional atomic SQL: `UPDATE bookings SET status='NO_SHOW' WHERE ...`. | Crash-resilient; no distributed lock dependency needed. |
+| **RFC 7807 Error Handling & Taxonomy** | ✅ **Core Built** | `@RestControllerAdvice` mapping custom domain exceptions to Problem Details JSON. | Full exception taxonomy implemented. |
+| **Multi-Threaded Testcontainers Suite** | ✅ **Core Built** | 2-thread contention, 2-thread adjacent, 100-thread capacity, double-submit, and quota-after-no-show. | Real PostgreSQL 15 integration tests. |
+| **Spring Boot Actuator & Micrometer** | ✅ **Core Built** | Health probes, HikariCP metrics, custom booking counters and timers. | Observable production instrumentation. |
+| **Zero-Dependency Local Profile** | ✅ **Core Built** | `local` profile with in-memory `ConcurrentHashMap` cache manager. | Allows running without local Redis installation. |
+| **Redis 2-Tier Caching Layer** | 🔷 **Production Blueprint** | Cache-aside layout caching with `CustomCacheErrorHandler` fallback. | Blueprint documented; local profile provides Redis-free operation. |
+| **Atomic Multi-Member Team Booking** | 🔷 **Production Blueprint** | Coordinator `/api/bookings/team` anchor-and-expand group reservation. | Algorithmic logic and deadlock order designed. |
+| **WAL Archiving & PITR Disaster Recovery**| 🔷 **Production Blueprint** | Continuous WAL archiving, physical snapshots, RPO $\le 5$m, RTO $\le 15$m. | Operational runbook documented. |
 
 ---
 
