@@ -122,11 +122,16 @@ The agent must strictly build each component with these 8 evaluation criteria in
 - Implement structured logging with SLF4J and MDC (Mapped Diagnostic Context) to attach `requestId`, `employeeId`, and `traceId`.
 
 ### 7. Caching Strategy
-- Leverage **Redis / Spring Cache abstraction**:
-  - `@Cacheable("floors")`: Cache static floor maps and desk coordinates with a long TTL (e.g., 24h).
-  - `@Cacheable("teams")`: Cache team rosters and membership.
-  - Evict or invalidate appropriately on administrative updates using `@CacheEvict`.
-  - **CRITICAL**: Booking persistence and final desk reservation MUST bypass the cache and run directly through the database with pessimistic locking to guarantee strict ACID consistency.
+- **Fundamental Rule**: Redis speeds up reads; PostgreSQL remains the single source of truth for booking and availability.
+- Leverage **Redis / Spring Cache abstraction** with **cache-aside pattern**:
+  - `@Cacheable("floors")`: Cache floor metadata (capacity, name) with TTL 30–60 min.
+  - `@Cacheable("floor-desks")`: Cache desk layout/coordinates (id, row, column, type) with TTL 30–60 min.
+  - `@Cacheable("teams")`: Cache team metadata and membership with TTL 15–30 min.
+  - `@Cacheable("employee-team")`: Cache employee → team mapping with TTL 15–30 min.
+- **Cache desk layout, NOT desk occupancy**: The cached desk data contains physical properties (coordinates, type) — never `available: true/false`.
+- Evict on admin mutations using `@CacheEvict`. TTL provides a safety net for missed invalidations. Redis uses `volatile-lru`.
+- **CRITICAL**: Booking persistence, desk availability checks, quota enforcement, and pessimistic row locks MUST bypass cache and run directly against PostgreSQL.
+- **Do NOT cache**: Active bookings count, availability flags, quota remaining at booking time, or any transactional booking state.
 
 ### 8. Error and Exception Handling Framework
 - Centralized exception handling via `@RestControllerAdvice`.

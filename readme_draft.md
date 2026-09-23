@@ -566,15 +566,21 @@ These are decisions we made where the assignment didn't prescribe a specific ans
 
 ### Core Tables
 
+> **Design Rule**: Desks are stored as **one row per desk** in PostgreSQL — never as JSON blobs. This enables SQL querying, foreign keys, indexes, row-level locking (`SELECT ... FOR UPDATE` on individual desk rows), and constraints. A desk row describes the **physical desk** (position, type). It does **not** store current availability.
+
 ```
 employees
 ---------
 id              BIGINT PK
 name            VARCHAR
 email           VARCHAR UNIQUE
+password_hash   VARCHAR          -- BCrypt(12), never plaintext
 team_id         BIGINT FK -> teams
-timezone        VARCHAR          -- e.g. "Asia/Kolkata"
-is_coordinator  BOOLEAN          -- can make team bookings
+timezone        VARCHAR          -- IANA timezone, e.g. "Asia/Kolkata"
+role            ENUM('EMPLOYEE', 'TEAM_COORDINATOR', 'ADMIN')
+is_active       BOOLEAN
+created_at      TIMESTAMP
+updated_at      TIMESTAMP
 ```
 
 ```
@@ -582,16 +588,20 @@ teams
 -----
 id              BIGINT PK
 name            VARCHAR
+created_at      TIMESTAMP
+updated_at      TIMESTAMP
 ```
 
 ```
 floors
 ------
 id              BIGINT PK
-name            VARCHAR
+floor_number    INT              -- physical floor number (1, 2, 3...)
+name            VARCHAR          -- e.g. "Floor 3"
 max_capacity    INT              -- e.g. 60
-center_row      INT              -- floor center coordinates
-center_col      INT              -- for seed placement
+is_active       BOOLEAN
+created_at      TIMESTAMP
+updated_at      TIMESTAMP
 ```
 
 ```
@@ -599,12 +609,16 @@ desks
 -----
 id              BIGINT PK
 floor_id        BIGINT FK -> floors
-row_pos         INT              -- x coordinate on floor map
-col_pos         INT              -- y coordinate on floor map
+row_number      INT              -- physical row on the floor grid
+column_number   INT              -- physical column on the floor grid
 desk_type       ENUM('HOT', 'FIXED')
-reserved_for    BIGINT FK -> employees (nullable, only for FIXED desks)
-is_active       BOOLEAN          -- can be set false for maintenance
+reserved_for_employee_id  BIGINT FK -> employees (nullable, only for FIXED)
+is_active       BOOLEAN          -- false for maintenance / decommissioned
+
+UNIQUE (floor_id, row_number, column_number)  -- no two desks at same position
 ```
+
+> **Important — No `is_available` column on desks.** A desk is a physical object. Its availability depends on `desk + requested date + existing bookings`. D42 might be booked on Sept 25 but available on Sept 26. Storing `is_available` as a mutable column would be misleading and introduce stale-state risks with our concurrency model.
 
 ```
 bookings
@@ -619,6 +633,7 @@ status          ENUM('BOOKED', 'CHECKED_IN', 'CANCELLED', 'NO_SHOW', 'RELEASED')
 created_at      TIMESTAMP
 checked_in_at   TIMESTAMP (nullable)
 cancelled_at    TIMESTAMP (nullable)
+updated_at      TIMESTAMP
 
 UNIQUE (desk_id, booking_date)  -- prevents double booking at DB level
 ```
@@ -629,18 +644,27 @@ team_floor_quotas
 id              BIGINT PK
 team_id         BIGINT FK -> teams
 floor_id        BIGINT FK -> floors
-max_desks       INT              -- e.g. 8
+max_desks       INT              -- e.g. "Team A ≤ 8 desks on Floor 3"
 ```
+
+### Key Constraints & Design Decisions
+
+| Constraint | Purpose |
+|------------|----------|
+| `UNIQUE (desk_id, booking_date)` on bookings | Prevents double-booking at the storage layer, even if application locking is bypassed. |
+| `UNIQUE (floor_id, row_number, column_number)` on desks | Guarantees no two desks occupy the same physical position on a floor. |
+| `reserved_for_employee_id` NOT NULL when `desk_type = 'FIXED'` | Fixed desks always have a named owner; hot desks always have NULL. Enforced by application logic. |
+| No `is_available` on desks | Availability is derived from bookings, not stored as mutable desk state. |
+| One row per desk | Enables `SELECT ... FOR UPDATE` on individual desk rows for pessimistic locking. |
 
 ### ER Relationships
 
 ```
-teams 1---* employees
-floors 1---* desks
-employees 1---* bookings
-desks 1---* bookings
-teams *---* floors (through team_floor_quotas)
-desks *---1 employees (reserved_for, nullable)
+Team 1────────< Employee
+Floor 1────────< Desk
+Employee 1────────< Booking >────────1 Desk
+Team *────────* Floor (through team_floor_quotas)
+Desk *────────1 Employee (reserved_for, nullable — FIXED desks only)
 ```
 
 ---
@@ -962,29 +986,163 @@ Enterprise applications must provide deep visibility into operational health:
 
 ### 7. Caching Strategy
 
+The most important caching rule for this system:
+
+> **Redis speeds up reads. PostgreSQL remains the single source of truth for booking and availability.**
+
+This is critical because of our concurrency design. Stale cache must never influence whether a desk gets booked.
+
+#### What We Cache vs. What We Don't
+
 ```text
-                                Caching Architecture
-                                
-       Incoming Request
-              │
-              ├── [Read-Heavy Static Data] ──▶ Redis Cache Layer 1 (TTL: 24h)
-              │   (Floors, Desks, Rosters)     (Instant response, 0 DB load)
-              │
-              └── [Write-Critical Booking]  ──▶ DIRECT DATABASE ACCESS
-                  (Seat Reservation)           (ACID Transaction + Pessimistic Row Lock)
+                      Caching Decision Matrix
+
+  ┌─────────────────────────────┬──────────────────────────────────┐
+  │     CACHE IN REDIS ✅       │     NEVER CACHE ❌               │
+  │                             │                                  │
+  │  Floor metadata             │  Desk availability               │
+  │  Desk layout/coordinates    │  Active bookings count           │
+  │  Team information           │  Quota remaining at booking time │
+  │  Employee → team mapping    │  Booking creation/commit         │
+  │                             │  Pessimistic row locks           │
+  └─────────────────────────────┴──────────────────────────────────┘
 ```
 
-#### Two-Tier Strategy
-1. **Tier 1: Read-Heavy, Slowly-Changing Data (Cached in Redis)**:
-   - Floor layouts, desk coordinates, team metadata (`@Cacheable(value = "floors", key = "#floorId")`).
-   - TTL: 24 hours. Invalidated via `@CacheEvict` only when an administrator alters floor geometry or capacity.
-2. **Tier 2: Real-Time Availability Snapshots**:
-   - General browse queries for available desks use a short TTL (e.g., 5 seconds) to buffer peak read traffic.
-3. **CRITICAL ACID Rule for Booking Commits**:
-   - **Reservation transactions NEVER rely on cache**.
-   - The actual booking creation bypasses cache and goes straight to PostgreSQL using pessimistic row locks. This guarantees that stale cache can never cause a double booking.
-4. **Eviction Policy**:
-   - Redis configured with `volatile-lru` (Least Recently Used) to prevent memory exhaustion.
+**Why not cache availability?** If Redis says "D42 → AVAILABLE" but Employee B just booked it, Employee A gets stale state. Our entire pessimistic locking mechanism becomes harder to reason about. Availability is always checked against PostgreSQL inside the booking transaction.
+
+**Cache desk layout, not desk occupancy.** The desk layout cache stores *physical desk properties* (coordinates, type) — never occupancy status:
+
+```json
+[
+  {"id": 10, "row": 2, "column": 3, "type": "HOT"},
+  {"id": 11, "row": 2, "column": 4, "type": "HOT"},
+  {"id": 20, "row": 3, "column": 3, "type": "FIXED", "reservedFor": 104}
+]
+```
+
+Notice what's missing: `"available": true`. We deliberately exclude occupancy state from the cache.
+
+#### Redis Key Structure
+
+```text
+Redis
+│
+├── floor:{floorId}              → floor metadata (capacity, name, number)
+│
+├── floor:{floorId}:desks        → desk layout (id, row, column, type)
+│
+├── employee:{employeeId}:team   → team membership
+│
+└── team:{teamId}                → team metadata (name, quota)
+```
+
+#### Cache-Aside Pattern
+
+```text
+GET floor:3
+      │
+      ▼
+    Redis
+   /     \
+ HIT      MISS
+ |          |
+ ▼          ▼
+return     PostgreSQL
+             |
+             ▼
+          put Redis
+             |
+             ▼
+           return
+```
+
+With Spring:
+
+```java
+@Cacheable(value = "floors", key = "#floorId")
+public FloorDto getFloor(Long floorId) {
+    return floorRepository.findById(floorId)
+        .map(floorMapper::toDto)
+        .orElseThrow(...);
+}
+```
+
+#### TTL & Eviction Policy
+
+| Cached Data | TTL | Eviction Trigger |
+| :--- | ---: | :--- |
+| Floor metadata | 30–60 min | Admin updates floor capacity or deactivates floor |
+| Desk layout | 30–60 min | Admin adds/removes/moves desks |
+| Team information | 15–30 min | Admin modifies team or quota config |
+| Employee → team | 15–30 min | Employee transferred to another team |
+
+Policy: **TTL + explicit invalidation** — not just one or the other. `@CacheEvict` fires on admin mutations; TTL provides a safety net for missed invalidations. Redis uses `volatile-lru` to prevent memory exhaustion.
+
+#### What About Active Team Bookings?
+
+Our allocation algorithm needs existing teammate coordinates. We *could* cache `team:10:bookings:2026-09-25`, but this data changes on every booking, cancellation, and no-show release. For a 500-desk assignment, querying PostgreSQL directly for active team bookings is completely reasonable and avoids invalidation complexity exactly where booking correctness matters most.
+
+#### Where Redis Fits in the Booking Flow
+
+```text
+Booking Request
+      │
+      ▼
+Employee/Team info ──── Redis (cached)
+      │
+      ▼
+Floor info ──────────── Redis (cached)
+      │
+      ▼
+Desk metadata ───────── Redis (cached)
+      │
+      ▼
+Generate candidates
+      │
+      ▼
+Calculate team proximity
+      │
+      ▼
+Ranked candidates
+      │
+      ▼
+PostgreSQL transaction ─── DIRECT DB (never cached)
+      │
+      ▼
+SELECT ... FOR UPDATE
+      │
+      ▼
+Re-check availability ─── DIRECT DB (never cached)
+      │
+      ▼
+Create booking
+      │
+      ▼
+COMMIT
+```
+
+Redis helps us arrive at the ranked candidate list faster. But **it never decides whether the booking is still valid** — that authority belongs exclusively to PostgreSQL with pessimistic row locking.
+
+#### Cache Invalidation on Admin Updates
+
+When an administrator changes desk layout or floor configuration:
+
+```text
+UPDATE DB
+   ↓
+Evict Redis key (@CacheEvict)
+   ↓
+Next request → cache miss → DB
+   ↓
+Repopulate cache
+```
+
+When somebody books a desk, we do **not** update `floor:{id}:desks` in Redis. That cache describes the *physical desk*, not its current occupancy. Booking events only affect PostgreSQL.
+
+#### Interview Defense
+
+> **Q: "Why cache desk layout but not availability?"**
+> *"We cache relatively static, frequently accessed data — floor metadata, desk coordinates, and team information. We deliberately do not treat cached availability as authoritative because booking is concurrency-sensitive. Availability is revalidated inside a PostgreSQL transaction with row-level locking, so PostgreSQL remains the single source of truth. This gives us the performance benefit of caching without introducing stale-state bugs in the critical booking path."*
 
 ---
 
