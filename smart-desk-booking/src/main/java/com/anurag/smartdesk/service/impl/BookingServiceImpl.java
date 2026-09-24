@@ -24,6 +24,8 @@ import com.anurag.smartdesk.service.EmployeeService;
 import com.anurag.smartdesk.strategy.CenterBasedStrategy;
 import com.anurag.smartdesk.strategy.DeskAllocationStrategy;
 import com.anurag.smartdesk.strategy.TeamNeighbourhoodStrategy;
+import com.anurag.smartdesk.exception.UnauthorizedOperationException;
+import com.anurag.smartdesk.model.Role;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -34,6 +36,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.List;
 
 /*
@@ -219,6 +222,33 @@ public class BookingServiceImpl implements BookingService {
                 floorId, bookingDate);
 
         return saved;
+    }
+
+    // ========================================================================
+    //  TEAM BOOKING (ATOMIC)
+    // ========================================================================
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public List<Booking> bookTeam(Long coordinatorId, List<Long> employeeIds, Long floorId, LocalDate bookingDate) {
+        Employee coordinator = employeeService.getEmployeeById(coordinatorId);
+        if (coordinator.getRole() != Role.TEAM_COORDINATOR && coordinator.getRole() != Role.ADMIN) {
+            throw new UnauthorizedOperationException("Only team coordinators or admins can make team bookings");
+        }
+
+        List<Booking> bookings = new ArrayList<>();
+        // Iterate and book for each employee. The outer @Transactional ensures this is atomic.
+        // Subsequent calls within the loop will see the newly inserted bookings (uncommitted)
+        // and adjust capacity, quota, and neighborhood centroid automatically!
+        for (Long empId : employeeIds) {
+            Booking booking = bookHotDesk(empId, floorId, bookingDate);
+            bookings.add(booking);
+        }
+
+        log.info("Team booking successful: coordinator={}, floor={}, date={}, size={}",
+                coordinatorId, floorId, bookingDate, employeeIds.size());
+
+        return bookings;
     }
 
     // ========================================================================
