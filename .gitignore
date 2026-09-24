@@ -1,1 +1,10 @@
 /*.vscode
+.vscode/
+
+# Local properties with credentials & secrets
+**/application-local.properties
+**/application-local.yml
+**/application-local.yaml
+**/*local.properties
+**/.env
+**/*.env
