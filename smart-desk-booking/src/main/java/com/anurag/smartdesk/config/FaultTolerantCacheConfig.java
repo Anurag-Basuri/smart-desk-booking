@@ -64,7 +64,11 @@ public class FaultTolerantCacheConfig implements CachingConfigurer {
 
         RedisCacheConfiguration defaultConfig =
                 RedisCacheConfiguration.defaultCacheConfig()
-                        .disableCachingNullValues();
+                        .disableCachingNullValues()
+                        .serializeValuesWith(
+                                org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair
+                                        .fromSerializer(new org.springframework.data.redis.serializer.JdkSerializationRedisSerializer(
+                                                Thread.currentThread().getContextClassLoader())));
 
         // Per-cache TTL overrides
         Map<String, RedisCacheConfiguration> perCacheConfig = Map.of(
