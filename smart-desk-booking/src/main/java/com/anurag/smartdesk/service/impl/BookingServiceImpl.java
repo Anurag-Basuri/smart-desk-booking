@@ -1,5 +1,7 @@
 package com.anurag.smartdesk.service.impl;
 
+import com.anurag.smartdesk.config.BookingMetrics;
+
 import com.anurag.smartdesk.exception.AlreadyBookedException;
 import com.anurag.smartdesk.exception.CutOffPassedException;
 import com.anurag.smartdesk.exception.InvalidBookingDateException;
@@ -85,6 +87,7 @@ public class BookingServiceImpl implements BookingService {
     private final TeamNeighbourhoodStrategy neighbourhoodStrategy;
     private final CenterBasedStrategy centerStrategy;
     private final Clock clock;
+    private final BookingMetrics metrics;
 
     public BookingServiceImpl(BookingRepository bookingRepository,
                               DeskRepository deskRepository,
@@ -93,7 +96,8 @@ public class BookingServiceImpl implements BookingService {
                               EmployeeService employeeService,
                               TeamNeighbourhoodStrategy neighbourhoodStrategy,
                               CenterBasedStrategy centerStrategy,
-                              Clock clock) {
+                              Clock clock,
+                              BookingMetrics metrics) {
         this.bookingRepository = bookingRepository;
         this.deskRepository = deskRepository;
         this.floorRepository = floorRepository;
@@ -102,6 +106,7 @@ public class BookingServiceImpl implements BookingService {
         this.neighbourhoodStrategy = neighbourhoodStrategy;
         this.centerStrategy = centerStrategy;
         this.clock = clock;
+        this.metrics = metrics;
     }
 
     // ========================================================================
@@ -134,6 +139,8 @@ public class BookingServiceImpl implements BookingService {
     @Transactional(rollbackFor = Exception.class)
     public Booking bookHotDesk(Long employeeId, Long floorId,
                                LocalDate bookingDate) {
+
+        metrics.incrementBookingRequests();
 
         Instant now = Instant.now(clock);
         LocalDate today = LocalDate.now(clock.withZone(OFFICE_ZONE));
@@ -182,10 +189,12 @@ public class BookingServiceImpl implements BookingService {
         }
 
         // --- Step 8: Pick the best desk ---
+        // Timer records how long the allocation algorithm takes
         DeskAllocationStrategy strategy = chooseStrategy(
                 teamId, floorId, bookingDate);
-        Desk chosenDesk = strategy.allocate(
-                availableDesks, floorId, teamId, bookingDate);
+        Desk chosenDesk = metrics.getAllocationLatency().record(() ->
+                strategy.allocate(
+                        availableDesks, floorId, teamId, bookingDate));
 
         // --- Step 9: Create and save the booking ---
         Booking booking = new Booking();
@@ -340,6 +349,7 @@ public class BookingServiceImpl implements BookingService {
 
         if (count > 0) {
             log.info("No-show sweep: marked {} bookings as NO_SHOW", count);
+            metrics.incrementNoShowReleases(count);
         }
 
         return count;
