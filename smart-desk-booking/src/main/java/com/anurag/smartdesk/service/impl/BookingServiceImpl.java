@@ -2,18 +2,25 @@ package com.anurag.smartdesk.service.impl;
 
 import com.anurag.smartdesk.config.BookingMetrics;
 
+import com.anurag.smartdesk.dto.response.DeskRecommendationResponse;
 import com.anurag.smartdesk.exception.AlreadyBookedException;
 import com.anurag.smartdesk.exception.CutOffPassedException;
+import com.anurag.smartdesk.exception.DeskAlreadyBookedException;
+import com.anurag.smartdesk.exception.DomainException;
 import com.anurag.smartdesk.exception.InvalidBookingDateException;
 import com.anurag.smartdesk.exception.InvalidCheckInException;
+import com.anurag.smartdesk.exception.InvalidDeskSelectionException;
 import com.anurag.smartdesk.exception.NoDeskAvailableException;
 import com.anurag.smartdesk.exception.QuotaExceededException;
 import com.anurag.smartdesk.exception.ResourceNotFoundException;
+import com.anurag.smartdesk.exception.UnauthorizedOperationException;
 import com.anurag.smartdesk.model.Booking;
 import com.anurag.smartdesk.model.BookingStatus;
 import com.anurag.smartdesk.model.Desk;
+import com.anurag.smartdesk.model.DeskType;
 import com.anurag.smartdesk.model.Employee;
 import com.anurag.smartdesk.model.Floor;
+import com.anurag.smartdesk.model.Role;
 import com.anurag.smartdesk.model.TeamFloorQuota;
 import com.anurag.smartdesk.repository.BookingRepository;
 import com.anurag.smartdesk.repository.DeskRepository;
@@ -24,10 +31,9 @@ import com.anurag.smartdesk.service.EmployeeService;
 import com.anurag.smartdesk.strategy.CenterBasedStrategy;
 import com.anurag.smartdesk.strategy.DeskAllocationStrategy;
 import com.anurag.smartdesk.strategy.TeamNeighbourhoodStrategy;
-import com.anurag.smartdesk.exception.UnauthorizedOperationException;
-import com.anurag.smartdesk.model.Role;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -37,7 +43,9 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /*
  * The central booking engine of the application.
@@ -141,7 +149,7 @@ public class BookingServiceImpl implements BookingService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public Booking bookHotDesk(Long employeeId, Long floorId,
-                               LocalDate bookingDate) {
+                               LocalDate bookingDate, Long deskId) {
 
         metrics.incrementBookingRequests();
 
@@ -182,24 +190,47 @@ public class BookingServiceImpl implements BookingService {
         // --- Step 6: Check team quota ---
         checkTeamQuota(quota, teamId, floorId, bookingDate);
 
-        // --- Step 7: Get available desks (fresh query under lock) ---
-        List<Desk> availableDesks = deskRepository
-                .findAvailableHotDesks(floorId, bookingDate);
+        // --- Step 7: Resolve the Desk (Manual Selection or Spatial Allocation) ---
+        Desk chosenDesk;
+        if (deskId != null) {
+            // Manual selection requested
+            Desk requestedDesk = deskRepository.findByIdForUpdate(deskId)
+                    .orElseThrow(() -> new ResourceNotFoundException("Desk not found with ID: " + deskId));
 
-        if (availableDesks.isEmpty()) {
-            throw new NoDeskAvailableException(
-                    "No available desks on this floor for " + bookingDate);
+            if (!requestedDesk.getFloor().getId().equals(floorId)) {
+                throw new InvalidDeskSelectionException("Desk " + deskId + " does not belong to floor " + floorId, "INVALID_FLOOR_DESK");
+            }
+            if (!requestedDesk.isActive()) {
+                throw new InvalidDeskSelectionException("Desk " + deskId + " is currently inactive", "DESK_INACTIVE");
+            }
+            if (requestedDesk.getDeskType() == DeskType.FIXED) {
+                if (requestedDesk.getReservedForEmployee() == null
+                        || !requestedDesk.getReservedForEmployee().getId().equals(employeeId)) {
+                    throw new UnauthorizedOperationException("Desk " + deskId + " is a fixed desk reserved for another employee");
+                }
+            }
+            if (bookingRepository.findActiveByDeskAndDate(deskId, bookingDate).isPresent()) {
+                throw new DeskAlreadyBookedException("Desk " + deskId + " is already booked for " + bookingDate);
+            }
+            chosenDesk = requestedDesk;
+        } else {
+            // Auto-allocation via spatial strategy
+            List<Desk> availableDesks = deskRepository
+                    .findAvailableHotDesks(floorId, bookingDate);
+
+            if (availableDesks.isEmpty()) {
+                throw new NoDeskAvailableException(
+                        "No available desks on this floor for " + bookingDate);
+            }
+
+            DeskAllocationStrategy strategy = chooseStrategy(
+                    teamId, floorId, bookingDate);
+            chosenDesk = metrics.getAllocationLatency().record(() ->
+                    strategy.allocate(
+                            availableDesks, floorId, teamId, bookingDate));
         }
 
-        // --- Step 8: Pick the best desk ---
-        // Timer records how long the allocation algorithm takes
-        DeskAllocationStrategy strategy = chooseStrategy(
-                teamId, floorId, bookingDate);
-        Desk chosenDesk = metrics.getAllocationLatency().record(() ->
-                strategy.allocate(
-                        availableDesks, floorId, teamId, bookingDate));
-
-        // --- Step 9: Create and save the booking ---
+        // --- Step 8: Create and save the booking ---
         Booking booking = new Booking();
         booking.setDesk(chosenDesk);
         booking.setEmployee(employee);
@@ -209,7 +240,7 @@ public class BookingServiceImpl implements BookingService {
         booking.setStartTime(WORKDAY_START);
         booking.setEndTime(LocalTime.of(18, 0));
         booking.setStatus(BookingStatus.BOOKED);
-        booking.setOwnerBooking(false);
+        booking.setOwnerBooking(chosenDesk.getDeskType() == DeskType.FIXED);
         booking.setCheckInDeadline(
                 computeCheckInDeadline(bookingDate, now));
         booking.setCreatedAt(now);
@@ -217,9 +248,9 @@ public class BookingServiceImpl implements BookingService {
 
         Booking saved = bookingRepository.save(booking);
 
-        log.info("Booking created: id={}, employee={}, desk={}, floor={}, date={}",
+        log.info("Booking created: id={}, employee={}, desk={}, floor={}, date={}, manual={}",
                 saved.getId(), employeeId, chosenDesk.getId(),
-                floorId, bookingDate);
+                floorId, bookingDate, (deskId != null));
 
         return saved;
     }
@@ -230,25 +261,67 @@ public class BookingServiceImpl implements BookingService {
 
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public List<Booking> bookTeam(Long coordinatorId, List<Long> employeeIds, Long floorId, LocalDate bookingDate) {
+    public List<Booking> bookTeam(Long coordinatorId, List<Long> employeeIds, Long floorId,
+                                  LocalDate bookingDate, List<Long> deskIds) {
         Employee coordinator = employeeService.getEmployeeById(coordinatorId);
         if (coordinator.getRole() != Role.TEAM_COORDINATOR && coordinator.getRole() != Role.ADMIN) {
             throw new UnauthorizedOperationException("Only team coordinators or admins can make team bookings");
         }
 
+        if (deskIds != null && !deskIds.isEmpty()) {
+            if (deskIds.size() != employeeIds.size()) {
+                throw new InvalidDeskSelectionException("Number of desk IDs (" + deskIds.size()
+                        + ") must match number of employees (" + employeeIds.size() + ")", "INVALID_TEAM_DESK_COUNT");
+            }
+            Set<Long> uniqueDesks = new HashSet<>(deskIds);
+            if (uniqueDesks.size() != deskIds.size()) {
+                throw new InvalidDeskSelectionException("Duplicate desk IDs specified in team booking", "DUPLICATE_DESK_SELECTION");
+            }
+        }
+
         List<Booking> bookings = new ArrayList<>();
-        // Iterate and book for each employee. The outer @Transactional ensures this is atomic.
-        // Subsequent calls within the loop will see the newly inserted bookings (uncommitted)
-        // and adjust capacity, quota, and neighborhood centroid automatically!
-        for (Long empId : employeeIds) {
-            Booking booking = bookHotDesk(empId, floorId, bookingDate);
+        for (int i = 0; i < employeeIds.size(); i++) {
+            Long empId = employeeIds.get(i);
+            Long dId = (deskIds != null && !deskIds.isEmpty()) ? deskIds.get(i) : null;
+            Booking booking = bookHotDesk(empId, floorId, bookingDate, dId);
             bookings.add(booking);
         }
 
-        log.info("Team booking successful: coordinator={}, floor={}, date={}, size={}",
-                coordinatorId, floorId, bookingDate, employeeIds.size());
+        log.info("Team booking successful: coordinator={}, floor={}, date={}, size={}, manual={}",
+                coordinatorId, floorId, bookingDate, employeeIds.size(), (deskIds != null && !deskIds.isEmpty()));
 
         return bookings;
+    }
+
+    // ========================================================================
+    //  SEAT RECOMMENDATIONS
+    // ========================================================================
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<DeskRecommendationResponse> getRecommendations(Long employeeId, Long floorId,
+                                                               LocalDate bookingDate, Integer limit) {
+        Employee employee = employeeService.getEmployeeById(employeeId);
+        Long teamId = employee.getTeam().getId();
+
+        List<Desk> availableDesks = deskRepository.findAvailableHotDesks(floorId, bookingDate);
+        if (availableDesks.isEmpty()) {
+            return List.of();
+        }
+
+        DeskAllocationStrategy strategy = chooseStrategy(teamId, floorId, bookingDate);
+        List<DeskAllocationStrategy.DeskScore> ranked = strategy.rank(availableDesks, floorId, teamId, bookingDate);
+
+        int max = (limit != null && limit > 0) ? Math.min(limit, ranked.size()) : ranked.size();
+        List<DeskRecommendationResponse> responses = new ArrayList<>(max);
+
+        for (int i = 0; i < max; i++) {
+            DeskAllocationStrategy.DeskScore ds = ranked.get(i);
+            responses.add(DeskRecommendationResponse.fromDesk(
+                    ds.desk(), i + 1, ds.score(), ds.reason()));
+        }
+
+        return responses;
     }
 
     // ========================================================================
