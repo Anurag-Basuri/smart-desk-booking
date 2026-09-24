@@ -12,6 +12,10 @@ public interface BookingService {
     // Internally selects the best desk using allocation strategies.
     Booking bookHotDesk(Long employeeId, Long floorId, LocalDate bookingDate);
 
+    // Book hot desks for a team (multiple members).
+    // Coordinator-only operation.
+    List<Booking> bookTeam(Long coordinatorId, List<Long> employeeIds, Long floorId, LocalDate bookingDate);
+
     // Cancel an existing booking.
     Booking cancelBooking(Long bookingId, Long employeeId);
 
