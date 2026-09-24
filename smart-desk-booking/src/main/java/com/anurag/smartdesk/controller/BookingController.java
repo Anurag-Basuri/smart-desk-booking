@@ -51,7 +51,8 @@ public class BookingController {
         Booking booking = bookingService.bookHotDesk(
                 employeeId,
                 request.getFloorId(),
-                request.getBookingDate());
+                request.getBookingDate(),
+                request.getDeskId());
 
         BookingResponse response = BookingResponse.fromEntity(booking);
 
@@ -63,7 +64,7 @@ public class BookingController {
 
     // POST /api/bookings/team
     // Header: Authorization: Bearer <token>
-    // Body: { "floorId": 1, "bookingDate": "2026-09-25", "employeeIds": [2, 3, 4] }
+    // Body: { "floorId": 1, "bookingDate": "2026-09-25", "employeeIds": [2, 3, 4], "deskIds": [10, 11, 12] }
     @PostMapping("/team")
     public ResponseEntity<ApiResponse<List<BookingResponse>>> bookTeam(
             Authentication auth,
@@ -75,7 +76,8 @@ public class BookingController {
                 coordinatorId,
                 request.getEmployeeIds(),
                 request.getFloorId(),
-                request.getBookingDate());
+                request.getBookingDate(),
+                request.getDeskIds());
 
         List<BookingResponse> responses = bookings.stream()
                 .map(BookingResponse::fromEntity)
