@@ -8,12 +8,12 @@ import com.anurag.smartdesk.service.BookingService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -21,11 +21,12 @@ import java.util.List;
 // REST API for all booking operations.
 //
 // Notice how slim this controller is — it does three things only:
-//   1. Accept and validate HTTP input (@Valid, @PathVariable, @RequestParam)
+//   1. Accept and validate HTTP input (@Valid, @PathVariable)
 //   2. Delegate to the BookingService
 //   3. Convert entities to DTOs and wrap in ApiResponse
 //
-// All business logic (locks, quotas, strategies) lives in BookingServiceImpl.
+// The employee ID is extracted from the JWT token automatically.
+// The JwtAuthFilter puts it in the Authentication principal.
 @RestController
 @RequestMapping("/api/bookings")
 public class BookingController {
@@ -36,17 +37,15 @@ public class BookingController {
         this.bookingService = bookingService;
     }
 
-    // POST /api/bookings?employeeId=1
+    // POST /api/bookings
+    // Header: Authorization: Bearer <token>
     // Body: { "floorId": 1, "bookingDate": "2026-09-25" }
-    //
-    // Why is employeeId a query param and not in the body?
-    // In production, this would come from the JWT token (the logged-in user).
-    // For now, we pass it as a query param so we can test without auth.
-    // When we add Spring Security later, we'll extract it from the token.
     @PostMapping
     public ResponseEntity<ApiResponse<BookingResponse>> bookDesk(
-            @RequestParam Long employeeId,
+            Authentication auth,
             @Valid @RequestBody BookingRequest request) {
+
+        Long employeeId = getEmployeeId(auth);
 
         Booking booking = bookingService.bookHotDesk(
                 employeeId,
@@ -61,11 +60,13 @@ public class BookingController {
                         "Desk booked successfully"));
     }
 
-    // POST /api/bookings/5/cancel?employeeId=1
+    // POST /api/bookings/5/cancel
     @PostMapping("/{bookingId}/cancel")
     public ResponseEntity<ApiResponse<BookingResponse>> cancelBooking(
-            @PathVariable Long bookingId,
-            @RequestParam Long employeeId) {
+            Authentication auth,
+            @PathVariable Long bookingId) {
+
+        Long employeeId = getEmployeeId(auth);
 
         Booking booking = bookingService.cancelBooking(
                 bookingId, employeeId);
@@ -77,11 +78,13 @@ public class BookingController {
                         "Booking cancelled successfully"));
     }
 
-    // POST /api/bookings/5/check-in?employeeId=1
+    // POST /api/bookings/5/check-in
     @PostMapping("/{bookingId}/check-in")
     public ResponseEntity<ApiResponse<BookingResponse>> checkIn(
-            @PathVariable Long bookingId,
-            @RequestParam Long employeeId) {
+            Authentication auth,
+            @PathVariable Long bookingId) {
+
+        Long employeeId = getEmployeeId(auth);
 
         Booking booking = bookingService.checkIn(
                 bookingId, employeeId);
@@ -93,10 +96,12 @@ public class BookingController {
                         "Checked in successfully"));
     }
 
-    // GET /api/bookings/history?employeeId=1
+    // GET /api/bookings/history
     @GetMapping("/history")
     public ResponseEntity<ApiResponse<List<BookingResponse>>> getHistory(
-            @RequestParam Long employeeId) {
+            Authentication auth) {
+
+        Long employeeId = getEmployeeId(auth);
 
         List<Booking> bookings = bookingService
                 .getBookingHistory(employeeId);
@@ -108,5 +113,11 @@ public class BookingController {
         return ResponseEntity.ok(
                 ApiResponse.success(responses,
                         "Booking history retrieved"));
+    }
+
+    // Extracts the employee ID from the JWT token.
+    // The JwtAuthFilter stores the employee ID as the Authentication principal.
+    private Long getEmployeeId(Authentication auth) {
+        return (Long) auth.getPrincipal();
     }
 }
