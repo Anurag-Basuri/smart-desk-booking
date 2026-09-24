@@ -13,6 +13,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.io.Serializable;
 import java.time.Instant;
 
 // Represents a physical desk in the office layout.
@@ -21,7 +22,7 @@ import java.time.Instant;
 @Getter
 @Setter
 @NoArgsConstructor
-public class Desk {
+public class Desk implements Serializable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

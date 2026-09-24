@@ -9,6 +9,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.io.Serializable;
 import java.time.Instant;
 
 // Represents a floor in the office building, which can contain multiple desks.
@@ -17,7 +18,7 @@ import java.time.Instant;
 @Getter
 @Setter
 @NoArgsConstructor
-public class Floor {
+public class Floor implements Serializable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

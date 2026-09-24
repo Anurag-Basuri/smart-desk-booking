@@ -13,6 +13,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.io.Serializable;
 import java.time.Instant;
 
 // Represents an employee in the organization who can book desks.
@@ -21,7 +22,7 @@ import java.time.Instant;
 @Getter
 @Setter
 @NoArgsConstructor
-public class Employee {
+public class Employee implements Serializable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

@@ -9,6 +9,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.io.Serializable;
 import java.time.Instant;
 
 // Represents a team within the organization, which can have multiple employees.
@@ -17,7 +18,7 @@ import java.time.Instant;
 @Getter
 @Setter
 @NoArgsConstructor
-public class Team {
+public class Team implements Serializable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
