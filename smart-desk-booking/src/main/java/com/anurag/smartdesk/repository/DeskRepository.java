@@ -1,7 +1,9 @@
 package com.anurag.smartdesk.repository;
 
 import com.anurag.smartdesk.model.Desk;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 
 import java.time.LocalDate;
@@ -15,6 +17,11 @@ public interface DeskRepository extends JpaRepository<Desk, Long> {
 
     // Find a fixed desk assigned to a specific employee
     Optional<Desk> findByReservedForEmployeeId(Long employeeId);
+
+    // Pessimistic lock on a specific desk row
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT d FROM Desk d WHERE d.id = :id")
+    Optional<Desk> findByIdForUpdate(Long id);
 
     /*
      * Find all HOT desks on a floor that are active AND not already booked

@@ -27,4 +27,11 @@ public interface DeskAllocationStrategy {
     // Pick the best desk from a list of available candidates.
     Desk allocate(List<Desk> availableDesks, Long floorId,
                   Long teamId, LocalDate bookingDate);
+
+    // Rank candidate desks from best to worst with spatial scores and explanations.
+    List<DeskScore> rank(List<Desk> availableDesks, Long floorId,
+                         Long teamId, LocalDate bookingDate);
+
+    // Immutable score record associating a desk with its spatial distance and rationale.
+    record DeskScore(Desk desk, int score, String reason) {}
 }
