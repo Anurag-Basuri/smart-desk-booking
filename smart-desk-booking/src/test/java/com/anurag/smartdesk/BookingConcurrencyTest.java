@@ -6,11 +6,13 @@ import com.anurag.smartdesk.model.Employee;
 import com.anurag.smartdesk.model.Floor;
 import com.anurag.smartdesk.model.Role;
 import com.anurag.smartdesk.model.Team;
+import com.anurag.smartdesk.model.TeamFloorQuota;
+import com.anurag.smartdesk.repository.BookingRepository;
 import com.anurag.smartdesk.repository.DeskRepository;
 import com.anurag.smartdesk.repository.EmployeeRepository;
 import com.anurag.smartdesk.repository.FloorRepository;
+import com.anurag.smartdesk.repository.TeamFloorQuotaRepository;
 import com.anurag.smartdesk.repository.TeamRepository;
-import com.anurag.smartdesk.repository.BookingRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -83,6 +85,9 @@ class BookingConcurrencyTest {
     @Autowired
     private BookingRepository bookingRepository;
 
+    @Autowired
+    private TeamFloorQuotaRepository quotaRepository;
+
     private Long targetDeskId;
     private String tokenAlice;
     private String tokenBob;
@@ -97,10 +102,10 @@ class BookingConcurrencyTest {
      */
     @BeforeEach
     void setUp() {
-        /* Use a far-future date that won't collide with manual tests.
-         * LocalDate.now() + 30 days ensures it's well within the
-         * booking window and won't conflict with existing data. */
-        bookingDate = LocalDate.now().plusDays(30);
+        /* Use a future date within the 14-day advance booking window
+         * that won't collide with manual tests. The service validates
+         * MAX_ADVANCE_DAYS = 14, so we use 7 days ahead to stay safe. */
+        bookingDate = LocalDate.now().plusDays(7);
 
         // Clean up any bookings on this date from previous runs
         bookingRepository.findAll().stream()
@@ -151,6 +156,19 @@ class BookingConcurrencyTest {
                     f.setCenterRow(3);
                     f.setCenterColumn(3);
                     return floorRepository.save(f);
+                });
+
+        /* Ensure the test team has a desk quota on this floor.
+         * Without this, the service throws QuotaExceededException (422)
+         * because every booking transaction checks team quota. */
+        quotaRepository.findByTeamIdAndFloorId(
+                team.getId(), floor.getId())
+                .orElseGet(() -> {
+                    TeamFloorQuota q = new TeamFloorQuota();
+                    q.setTeam(team);
+                    q.setFloor(floor);
+                    q.setMaxDesks(10);
+                    return quotaRepository.save(q);
                 });
 
         /* Find or create a single HOT desk on this floor.
