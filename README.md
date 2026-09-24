@@ -9,21 +9,22 @@
 2. [Key Features](#-key-features)
 3. [Technology Stack](#-technology-stack)
 4. [Project Architecture](#-project-architecture)
-5. [Quick Start & Setup Guide](#-quick-start--setup-guide)
+5. [Database Schema (ER Diagram)](#-database-schema-er-diagram)
+6. [Quick Start & Setup Guide](#-quick-start--setup-guide)
    - [Prerequisites](#prerequisites)
    - [Configuration Setup](#configuration-setup)
    - [Running the Server](#running-the-server)
    - [Verifying Health](#verifying-health)
-6. [How the System Works (Explained Simply)](#-how-the-system-works-explained-simply)
+7. [How the System Works (Explained Simply)](#-how-the-system-works-explained-simply)
    - [1. Spatial Neighborhood Allocation Algorithm](#1-spatial-neighborhood-allocation-algorithm)
    - [2. Race Condition Prevention & Pessimistic Locking](#2-race-condition-prevention--pessimistic-locking)
    - [3. Multi-Member Team Booking (Anchor-and-Expand)](#3-multi-member-team-booking-anchor-and-expand)
    - [4. Desk Types & Headroom Invariants](#4-desk-types--headroom-invariants)
    - [5. Caching & Fault Tolerance](#5-caching--fault-tolerance)
    - [6. Life-Cycle, No-Shows & Walk-Ins](#6-life-cycle-no-shows--walk-ins)
-7. [API Walkthrough & Examples](#-api-walkthrough--examples)
-8. [Design Trade-offs & Engineering Decisions](#-design-trade-offs--engineering-decisions)
-9. [Project Directory Layout](#-project-directory-layout)
+8. [API Walkthrough & Examples](#-api-walkthrough--examples)
+9. [Design Trade-offs & Engineering Decisions](#-design-trade-offs--engineering-decisions)
+10. [Project Directory Layout](#-project-directory-layout)
 
 ---
 
@@ -94,6 +95,112 @@ com.anurag.smartdesk
 │   └── impl/
 └── util/                # Coordinate math, time/clock abstractions
 ```
+
+---
+
+## 🗃️ Database Schema (ER Diagram)
+
+The system uses **6 core tables** in PostgreSQL, connected by foreign key relationships. Flyway manages the schema via [`V1__init_schema.sql`](file:///d:/projects/smart-desk-booking/smart-desk-booking/src/main/resources/db/migration/V1__init_schema.sql).
+
+```mermaid
+erDiagram
+    teams {
+        BIGSERIAL id PK
+        VARCHAR(100) name UK "NOT NULL, UNIQUE"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    employees {
+        BIGSERIAL id PK
+        VARCHAR(100) name "NOT NULL"
+        VARCHAR(255) email UK "NOT NULL, UNIQUE"
+        VARCHAR(255) password_hash "NOT NULL, BCrypt"
+        BIGINT team_id FK "NOT NULL"
+        VARCHAR(50) timezone "DEFAULT Asia/Kolkata"
+        VARCHAR(30) role "EMPLOYEE | TEAM_COORDINATOR | ADMIN"
+        BOOLEAN is_active "DEFAULT TRUE"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    floors {
+        BIGSERIAL id PK
+        INT floor_number UK "NOT NULL, UNIQUE"
+        VARCHAR(100) name "NOT NULL"
+        INT max_capacity "CHECK > 0"
+        INT center_row "Centroid X for spatial seeding"
+        INT center_column "Centroid Y for spatial seeding"
+        VARCHAR(50) timezone "DEFAULT Asia/Kolkata"
+        BOOLEAN is_active "DEFAULT TRUE"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    desks {
+        BIGSERIAL id PK
+        BIGINT floor_id FK "NOT NULL"
+        INT row_number "Grid coordinate X"
+        INT column_number "Grid coordinate Y"
+        VARCHAR(20) desk_type "HOT | FIXED"
+        BIGINT reserved_for_employee_id FK "NULL for HOT desks"
+        BOOLEAN is_active "DEFAULT TRUE"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    team_floor_quotas {
+        BIGSERIAL id PK
+        BIGINT team_id FK "NOT NULL"
+        BIGINT floor_id FK "NOT NULL"
+        INT max_desks "CHECK >= 0"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    bookings {
+        BIGSERIAL id PK
+        BIGINT desk_id FK "NOT NULL"
+        BIGINT employee_id FK "NOT NULL"
+        BIGINT team_id FK "NOT NULL (denormalized)"
+        BIGINT floor_id FK "NOT NULL (denormalized)"
+        DATE booking_date "NOT NULL"
+        TIME start_time "NOT NULL"
+        TIME end_time "NOT NULL, CHECK > start_time"
+        TIMESTAMPTZ check_in_deadline "NOT NULL"
+        VARCHAR(20) status "BOOKED | CHECKED_IN | CANCELLED | NO_SHOW"
+        BOOLEAN is_owner_booking "DEFAULT FALSE"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ checked_in_at "NULL until check-in"
+        TIMESTAMPTZ cancelled_at "NULL unless cancelled"
+        TIMESTAMPTZ updated_at
+    }
+
+    teams ||--o{ employees : "has members"
+    teams ||--o{ team_floor_quotas : "quota per floor"
+    teams ||--o{ bookings : "team bookings"
+
+    floors ||--o{ desks : "contains desks"
+    floors ||--o{ team_floor_quotas : "quota per team"
+    floors ||--o{ bookings : "floor bookings"
+
+    employees ||--o{ bookings : "makes bookings"
+    employees ||--o| desks : "owns fixed desk"
+
+    desks ||--o{ bookings : "booked via"
+```
+
+### Key Database Constraints & Indexes
+
+| Constraint / Index | Type | Purpose |
+|---|---|---|
+| `uq_active_desk_day` | Partial Unique Index | Prevents double-booking: only one active booking per desk per day |
+| `uq_active_employee_day` | Partial Unique Index | One active booking per employee per calendar day |
+| `idx_bookings_team_quota` | Partial Composite Index | Fast team quota enforcement scans (hot bookings only) |
+| `idx_bookings_floor_capacity` | Partial Composite Index | Fast floor headroom checks (hot bookings only) |
+| `idx_bookings_noshow_sweep` | Partial Index | Efficient no-show auto-release background sweeps |
+| `chk_desk_fixed_owner` | Check Constraint | FIXED desks must have an owner; HOT desks must not |
+| `uq_floor_row_col` | Unique Constraint | No two desks share the same grid position on a floor |
 
 ---
 
