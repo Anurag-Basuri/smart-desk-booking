@@ -24,6 +24,18 @@ public interface BookingRepository extends JpaRepository<Booking, Long> {
     """)
     Optional<Booking> findActiveByEmployeeAndDate(Long employeeId, LocalDate date);
 
+    // Find active booking for a specific desk on a date (to prevent double-booking)
+    @Query("""
+        SELECT b FROM Booking b
+        WHERE b.desk.id = :deskId
+        AND b.bookingDate = :date
+        AND b.status IN (
+            com.anurag.smartdesk.model.BookingStatus.BOOKED,
+            com.anurag.smartdesk.model.BookingStatus.CHECKED_IN
+        )
+    """)
+    Optional<Booking> findActiveByDeskAndDate(Long deskId, LocalDate date);
+
     // Count active HOT bookings for a team on a floor on a date (for quota check)
     @Query("""
         SELECT COUNT(b) FROM Booking b

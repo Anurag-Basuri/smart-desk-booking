@@ -22,4 +22,8 @@ public class TeamBookingRequest {
 
     @NotEmpty(message = "Employee IDs list cannot be empty")
     private List<Long> employeeIds;
+
+    // Optional manual desk IDs corresponding to the employeeIds list in order.
+    // If omitted, anchor-and-expand clustering algorithm automatically allocates adjacent desks.
+    private List<Long> deskIds;
 }
