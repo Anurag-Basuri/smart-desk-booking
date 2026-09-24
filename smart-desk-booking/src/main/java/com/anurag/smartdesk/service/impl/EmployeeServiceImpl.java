@@ -4,6 +4,7 @@ import com.anurag.smartdesk.exception.ResourceNotFoundException;
 import com.anurag.smartdesk.model.Employee;
 import com.anurag.smartdesk.repository.EmployeeRepository;
 import com.anurag.smartdesk.service.EmployeeService;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -15,7 +16,10 @@ public class EmployeeServiceImpl implements EmployeeService {
         this.employeeRepository = employeeRepository;
     }
 
+    // Cached because employee → team mapping changes only on team transfers.
+    // TTL = 15 minutes (configured in RedisConfig).
     @Override
+    @Cacheable(value = "employee-team", key = "#id")
     public Employee getEmployeeById(Long id) {
         return employeeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException(
