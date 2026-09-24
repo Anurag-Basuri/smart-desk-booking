@@ -1,13 +1,16 @@
 package com.anurag.smartdesk.controller;
 
 import com.anurag.smartdesk.dto.response.ApiResponse;
+import com.anurag.smartdesk.dto.response.DeskRecommendationResponse;
 import com.anurag.smartdesk.dto.response.DeskResponse;
 import com.anurag.smartdesk.dto.response.FloorResponse;
 import com.anurag.smartdesk.model.Desk;
 import com.anurag.smartdesk.model.Floor;
+import com.anurag.smartdesk.service.BookingService;
 import com.anurag.smartdesk.service.DeskService;
 import com.anurag.smartdesk.service.FloorService;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -24,11 +27,14 @@ public class FloorController {
 
     private final FloorService floorService;
     private final DeskService deskService;
+    private final BookingService bookingService;
 
     public FloorController(FloorService floorService,
-                           DeskService deskService) {
+                           DeskService deskService,
+                           BookingService bookingService) {
         this.floorService = floorService;
         this.deskService = deskService;
+        this.bookingService = bookingService;
     }
 
     // GET /api/floors
@@ -95,5 +101,23 @@ public class FloorController {
         return ResponseEntity.ok(
                 ApiResponse.success(responses,
                         "Available desks retrieved"));
+    }
+
+    // GET /api/floors/1/recommendations?date=2026-09-28&limit=10
+    // Returns the best available seats ranked by proximity to teammates/centroid.
+    @GetMapping("/{floorId}/recommendations")
+    public ResponseEntity<ApiResponse<List<DeskRecommendationResponse>>> getRecommendations(
+            Authentication auth,
+            @PathVariable Long floorId,
+            @RequestParam LocalDate date,
+            @RequestParam(required = false, defaultValue = "10") Integer limit) {
+
+        Long employeeId = (Long) auth.getPrincipal();
+        List<DeskRecommendationResponse> recommendations = bookingService
+                .getRecommendations(employeeId, floorId, date, limit);
+
+        return ResponseEntity.ok(
+                ApiResponse.success(recommendations,
+                        "Seat recommendations retrieved successfully"));
     }
 }
