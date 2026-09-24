@@ -1,6 +1,7 @@
 package com.anurag.smartdesk.controller;
 
 import com.anurag.smartdesk.dto.request.BookingRequest;
+import com.anurag.smartdesk.dto.request.TeamBookingRequest;
 import com.anurag.smartdesk.dto.response.ApiResponse;
 import com.anurag.smartdesk.dto.response.BookingResponse;
 import com.anurag.smartdesk.model.Booking;
@@ -58,6 +59,32 @@ public class BookingController {
                 .status(HttpStatus.CREATED)
                 .body(ApiResponse.success(response,
                         "Desk booked successfully"));
+    }
+
+    // POST /api/bookings/team
+    // Header: Authorization: Bearer <token>
+    // Body: { "floorId": 1, "bookingDate": "2026-09-25", "employeeIds": [2, 3, 4] }
+    @PostMapping("/team")
+    public ResponseEntity<ApiResponse<List<BookingResponse>>> bookTeam(
+            Authentication auth,
+            @Valid @RequestBody TeamBookingRequest request) {
+
+        Long coordinatorId = getEmployeeId(auth);
+
+        List<Booking> bookings = bookingService.bookTeam(
+                coordinatorId,
+                request.getEmployeeIds(),
+                request.getFloorId(),
+                request.getBookingDate());
+
+        List<BookingResponse> responses = bookings.stream()
+                .map(BookingResponse::fromEntity)
+                .toList();
+
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(ApiResponse.success(responses,
+                        "Team desks booked successfully"));
     }
 
     // POST /api/bookings/5/cancel
